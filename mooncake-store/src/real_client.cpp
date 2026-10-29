@@ -1345,7 +1345,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         if (enable_kvcs) {
             file_storage_config.storage_backend_type =
                 StorageBackendType::kDistributed;
-            file_storage_config.kvcs_tenant_id = client_->tenant_id();
         }
         if (!ssd_offload_path.empty()) {
             file_storage_config.storage_filepath = ssd_offload_path;
@@ -1359,6 +1358,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << init_result.error();
             return init_result;
         }
+    }
+    if (enable_ssd_offload) {
         // The dangling-replica heal in Client::Put needs an existence check
         // against this process's offload files, which only the FileStorage
         // owns. true: backing file is gone, false: present, nullopt: unknown.

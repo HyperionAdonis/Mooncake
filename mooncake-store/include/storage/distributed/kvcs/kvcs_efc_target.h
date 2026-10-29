@@ -10,8 +10,9 @@
 namespace mooncake {
 
 struct KvcsEfcTarget {
-    std::string id;
     uint32_t mountpoint_index = 1;
+    std::string mountpoint_id;
+    std::string metrics_endpoint;
 };
 
 // This stage accepts exactly one shared KVCacheStore mountpoint.

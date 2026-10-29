@@ -48,9 +48,8 @@ struct DistributedStorageEnvironment {
     ScopedEnvVar legacy_root_dir{"MOONCAKE_DISTRIBUTED_ROOT_DIR"};
     ScopedEnvVar fs_adapter{"MOONCAKE_DFS_FS_ADAPTER"};
     ScopedEnvVar legacy_fs_adapter{"MOONCAKE_DISTRIBUTED_FS_TYPE"};
-    ScopedEnvVar kvcs_mode{"MOONCAKE_KVCS_MODE"};
+    ScopedEnvVar kvcs_efc_config{"MOONCAKE_KVCS_EFC_CONFIG"};
     ScopedEnvVar kvcs_socket{"MOONCAKE_KVCS_EFC_SOCKET"};
-    ScopedEnvVar kvcs_query_timeout{"MOONCAKE_KVCS_QUERY_TIMEOUT_MS"};
     ScopedEnvVar health_check{"MOONCAKE_DISTRIBUTED_HEALTH_CHECK"};
     ScopedEnvVar shard_count{"MOONCAKE_DFS_SHARD_COUNT"};
     ScopedEnvVar shard_capacity{"MOONCAKE_DFS_SHARD_CAPACITY"};
@@ -78,7 +77,6 @@ void ExpectDefaultConfig(const DistributedStorageConfig& config) {
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.7);
     EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(30));
     EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(5));
-    EXPECT_EQ(config.provider_query_timeout_ms, 50u);
 }
 
 DistributedStorageConfig ValidConfig() {
@@ -123,7 +121,6 @@ TEST_F(DistributedStorageConfigTest, ReadsValidEnvironmentValues) {
     env.eviction_low_watermark.Set("0.65");
     env.deferred_free_seconds.Set("12");
     env.eviction_check_interval.Set("3");
-    env.kvcs_query_timeout.Set("75");
 
     const auto config = DistributedStorageConfig::FromEnvironment();
 
@@ -139,7 +136,6 @@ TEST_F(DistributedStorageConfigTest, ReadsValidEnvironmentValues) {
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.65);
     EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(12));
     EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(3));
-    EXPECT_EQ(config.provider_query_timeout_ms, 75u);
     EXPECT_TRUE(config.Validate());
     EXPECT_TRUE(config.ValidateForAllocator());
 
@@ -178,19 +174,21 @@ TEST_F(DistributedStorageConfigTest,
     EXPECT_FALSE(config.enable_health_check);
 }
 
-TEST_F(DistributedStorageConfigTest, ExplicitKvcsModeSelectsLowLevel) {
+TEST_F(DistributedStorageConfigTest, ExplicitKvcsAdapterSelectsLowLevel) {
     env.kvcs_socket.Set("/var/run/kvcs/efc-grpc.sock");
-    env.kvcs_mode.Set("low-level");
+    env.fs_adapter.Set("kvcs-lowlevel");
+    env.kvcs_efc_config.Set("/etc/kvcs/efc.yaml");
 
     const auto config = DistributedStorageConfig::FromEnvironment();
 
     EXPECT_EQ(config.fs_adapter_type, "kvcs-lowlevel");
+    EXPECT_EQ(config.object_storage_config_path, "/etc/kvcs/efc.yaml");
     EXPECT_TRUE(config.enable_health_check);
 }
 
 TEST_F(DistributedStorageConfigTest, KvcsHealthCheckCanBeExplicitlyDisabled) {
     env.health_check.Set("false");
-    env.kvcs_mode.Set("low-level");
+    env.fs_adapter.Set("kvcs-lowlevel");
     const auto config = DistributedStorageConfig::FromEnvironment();
     EXPECT_TRUE(config.UsesKvcs());
     EXPECT_FALSE(config.enable_health_check);
@@ -269,17 +267,24 @@ TEST_F(DistributedStorageConfigTest,
     EXPECT_TRUE(logs.empty());
 }
 
-TEST(DistributedStorageConfigValidationTest, AcceptsKvcsQueryHealthCheck) {
+TEST(DistributedStorageConfigValidationTest, AcceptsKvcsHealthCheck) {
     DistributedStorageConfig config;
     config.fs_adapter_type = "kvcs-lowlevel";
     config.enable_health_check = true;
     EXPECT_TRUE(config.Validate());
 }
 
-TEST(DistributedStorageConfigValidationTest, RejectsZeroProviderQueryTimeout) {
+TEST(DistributedStorageConfigValidationTest, KvcsUsesDfsEvictionSettings) {
     DistributedStorageConfig config;
     config.fs_adapter_type = "kvcs-lowlevel";
-    config.provider_query_timeout_ms = 0;
+    EXPECT_TRUE(config.Validate());
+
+    config.eviction_low_watermark = config.eviction_high_watermark;
+    EXPECT_FALSE(config.Validate());
+    config.eviction_low_watermark = 0.7;
+
+    config.eviction_enabled = false;
+    config.eviction_check_interval = std::chrono::seconds(0);
     EXPECT_FALSE(config.Validate());
 }
 

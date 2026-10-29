@@ -62,6 +62,7 @@ class EtcdOpLogStore;
 class ShardAllocator;
 class DfsAllocatorInterface;
 class ImmutableBucketAllocator;
+class KvcsEfcMetricsCapacityProvider;
 
 // Forward declarations
 class AllocationStrategy;
@@ -565,7 +566,8 @@ class MasterService {
      * caller's query and this call is left untouched.
      * @param client_id The client performing the eviction
      * @param key The object key whose disk replica was evicted
-     * @param replica_type DISK or LOCAL_DISK
+     * @param replica_type DISK, LOCAL_DISK, or DFS. DFS is accepted only for
+     * a KVCS object-storage replica through this conditional API.
      * @param expected_replica_id The replica id the caller failed on
      * @return true if the replica was evicted, false if the precondition did
      * not hold (the replica was replaced or is already gone), or an error
@@ -655,6 +657,16 @@ class MasterService {
      */
     auto Remove(const std::string& key, const TenantId& tenant_id,
                 bool force = false) -> tl::expected<void, ErrorCode>;
+
+    std::vector<tl::expected<ReplicaID, ErrorCode>> BatchRemoveStart(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const TenantId& tenant_id, bool force = false);
+    std::vector<tl::expected<void, ErrorCode>> BatchRemoveEnd(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<ReplicaID>& replica_ids, const TenantId& tenant_id);
+    std::vector<tl::expected<void, ErrorCode>> BatchRemoveRevoke(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<ReplicaID>& replica_ids, const TenantId& tenant_id);
 
     /**
      * @brief Removes objects from the master whose keys match a regex pattern.
@@ -1563,6 +1575,7 @@ class MasterService {
     void RunDfsEviction();
     void RunShardDfsEviction();
     void RunBucketDfsEviction();
+    void RefreshKvcsDfsUsage();
     bool RunBucketDfsEvictionInternal(bool force_one);
     bool TryRecoverDfsSpaceAfterAllocationFailure();
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
@@ -1604,6 +1617,7 @@ class MasterService {
     DeadlineScheduler<GracefulUnmountDeadlineRecord>
         graceful_unmount_scheduler_;
     BackgroundWorker replica_cleanup_worker_;
+    BackgroundWorker kvcs_capacity_refresh_worker_;
     const bool enable_async_segment_cleanup_;
 
     /**
@@ -2190,6 +2204,10 @@ class MasterService {
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
     std::optional<std::string> dfs_kvcs_backend_;
+    std::unique_ptr<KvcsEfcMetricsCapacityProvider> dfs_kvcs_capacity_provider_;
+    std::chrono::seconds dfs_kvcs_capacity_check_interval_{5};
+    mutable std::mutex dfs_kvcs_usage_mutex_;
+    DfsUsageSnapshot dfs_kvcs_usage_;
     std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
     ShardAllocator* shard_allocator_{nullptr};
     ImmutableBucketAllocator* bucket_allocator_{nullptr};

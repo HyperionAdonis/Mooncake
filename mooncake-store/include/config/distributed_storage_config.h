@@ -23,7 +23,6 @@ struct DistributedStorageConfig {
     std::chrono::seconds deferred_free_duration{30};
     std::chrono::seconds eviction_check_interval{5};
     std::string object_storage_config_path;
-    uint32_t provider_query_timeout_ms = 50;
 
     bool UsesObjectStorage() const {
         return fs_adapter_type == "oss" || fs_adapter_type == "kvcs-lowlevel";

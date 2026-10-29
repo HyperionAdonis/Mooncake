@@ -65,12 +65,15 @@ AutoPortBinder::~AutoPortBinder() {
     }
 }
 
-tl::expected<std::string, int> httpGet(const std::string &url) {
+tl::expected<std::string, int> httpGet(const std::string &url,
+                                       std::chrono::milliseconds timeout) {
     coro_http::coro_http_client client;
-    auto res = client.get(url);
-    if (res.status == 200) {
-        return std::string(res.resp_body);
+    if (timeout.count() > 0) {
+        client.set_conn_timeout(timeout);
+        client.set_req_timeout(timeout);
     }
+    auto res = client.get(url);
+    if (res.status == 200) return std::string(res.resp_body);
     return tl::unexpected(res.status);
 }
 

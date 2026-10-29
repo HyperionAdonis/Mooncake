@@ -1,9 +1,9 @@
 #pragma once
 
-#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -27,7 +27,6 @@ struct DfsWriteRequest {
     std::string key;
     DistributedFSDescriptor descriptor;
     std::vector<Slice> slices;
-    bool replace_existing = false;
 };
 
 struct DfsReadRequest {
@@ -83,13 +82,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::vector<tl::expected<void, ErrorCode>> BatchRead(
         const std::vector<DfsReadRequest>& requests);
 
-    bool SupportsProviderQuery() const;
-    std::chrono::milliseconds ProviderQueryTimeout() const;
-    bool IsProviderReplica(const Replica::Descriptor& replica) const;
-    ObjectStorageQueryResults BatchQueryProvider(
-        std::span<const std::string> logical_keys,
-        std::chrono::steady_clock::time_point deadline);
-    ObjectStorageIoResults BatchDeleteProvider(
+    ObjectStorageIoResults BatchDeleteObjects(
         std::span<const std::string> logical_keys);
 
     // Key-only storage backend operations cannot safely address DFS objects;

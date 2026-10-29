@@ -1,6 +1,7 @@
 #include "storage/distributed/distributed_storage_backend.h"
 
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <limits>
 #include <map>
@@ -641,10 +642,11 @@ DistributedStorageBackend::BatchWrite(
     }
 
     if (UsesObjectStorage()) {
-        results.resize(requests.size());
-        std::vector<ObjectStoragePutRequest> object_requests;
+        std::vector<ObjectPutRequest> object_requests;
+        std::vector<std::vector<iovec>> iov_storage;
         std::vector<size_t> request_indices;
         object_requests.reserve(requests.size());
+        iov_storage.reserve(requests.size());
         request_indices.reserve(requests.size());
         for (size_t index = 0; index < requests.size(); ++index) {
             const auto& request = requests[index];
@@ -655,19 +657,25 @@ DistributedStorageBackend::BatchWrite(
             }
             auto total_size = CalculateSliceBytes(request.slices);
             if (request.slices.empty() || !total_size ||
+                request.slices.size() >
+                    static_cast<size_t>(std::numeric_limits<int>::max()) ||
                 !IsObjectDescriptorValid(desc, distributed_config_,
                                          *object_storage_adapter_) ||
                 *total_size != desc.object_size) {
                 results[index] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
+            auto& iovs = iov_storage.emplace_back();
+            iovs.reserve(request.slices.size());
+            for (const auto& slice : request.slices)
+                iovs.push_back({slice.ptr, slice.size});
             object_requests.push_back(
-                {request.key, request.slices, request.replace_existing});
+                {request.key, iovs.data(), static_cast<int>(iovs.size())});
             request_indices.push_back(index);
         }
 
         auto object_results =
-            object_storage_adapter_->BatchPutV(object_requests);
+            object_storage_adapter_->PutBatch(object_requests);
         if (object_results.size() != object_requests.size()) {
             for (size_t index : request_indices) {
                 results[index] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -758,10 +766,13 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     }
 
     if (UsesObjectStorage()) {
-        results.resize(requests.size());
-        std::vector<ObjectStorageGetRequest> object_requests;
+        std::vector<ObjectGetRequest> object_requests;
+        std::vector<std::vector<char>> staging_buffers;
+        std::vector<size_t> staging_request_positions;
         std::vector<size_t> request_indices;
         object_requests.reserve(requests.size());
+        staging_buffers.reserve(requests.size());
+        staging_request_positions.reserve(requests.size());
         request_indices.reserve(requests.size());
         for (size_t index = 0; index < requests.size(); ++index) {
             const auto& request = requests[index];
@@ -779,21 +790,53 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
                 results[index] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
-            object_requests.push_back({request.key, request.slices,
-                                       static_cast<size_t>(desc.object_size)});
+            void* buffer = request.slices.front().ptr;
+            size_t staging_position = std::numeric_limits<size_t>::max();
+            if (request.slices.size() > 1) {
+                staging_position = staging_buffers.size();
+                staging_buffers.emplace_back(
+                    static_cast<size_t>(desc.object_size));
+                buffer = staging_buffers.back().data();
+            }
+            object_requests.push_back(
+                {request.key, buffer, static_cast<size_t>(desc.object_size)});
+            staging_request_positions.push_back(staging_position);
             request_indices.push_back(index);
         }
 
         auto object_results =
-            object_storage_adapter_->BatchGetInto(object_requests);
+            object_storage_adapter_->GetBatch(object_requests);
         if (object_results.size() != object_requests.size()) {
             for (size_t index : request_indices) {
                 results[index] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
             return results;
         }
-        for (size_t index = 0; index < object_results.size(); ++index) {
-            results[request_indices[index]] = std::move(object_results[index]);
+        for (size_t i = 0; i < object_results.size(); ++i) {
+            const size_t request_index = request_indices[i];
+            if (!object_results[i]) {
+                results[request_index] =
+                    tl::make_unexpected(object_results[i].error());
+                continue;
+            }
+            if (*object_results[i] != object_requests[i].size) {
+                results[request_index] =
+                    tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                continue;
+            }
+            const size_t staging_position = staging_request_positions[i];
+            if (staging_position != std::numeric_limits<size_t>::max()) {
+                const auto& buffer = staging_buffers[staging_position];
+                size_t offset = 0;
+                for (const auto& slice : requests[request_index].slices) {
+                    if (offset == buffer.size()) break;
+                    const size_t length =
+                        std::min(slice.size, buffer.size() - offset);
+                    std::memcpy(slice.ptr, buffer.data() + offset, length);
+                    offset += length;
+                }
+            }
+            results[request_index] = {};
         }
         return results;
     }
@@ -875,46 +918,14 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     return results;
 }
 
-bool DistributedStorageBackend::SupportsProviderQuery() const {
-    return UsesObjectStorage() && object_storage_adapter_ &&
-           object_storage_adapter_->SupportsProviderQuery();
-}
-
-std::chrono::milliseconds DistributedStorageBackend::ProviderQueryTimeout()
-    const {
-    return std::chrono::milliseconds(
-        distributed_config_.provider_query_timeout_ms);
-}
-
-bool DistributedStorageBackend::IsProviderReplica(
-    const Replica::Descriptor& replica) const {
-    return UsesObjectStorage() && object_storage_adapter_ &&
-           replica.is_dfs_replica() &&
-           IsObjectDescriptorValid(replica.get_dfs_descriptor(),
-                                   distributed_config_,
-                                   *object_storage_adapter_);
-}
-
-ObjectStorageQueryResults DistributedStorageBackend::BatchQueryProvider(
-    std::span<const std::string> logical_keys,
-    std::chrono::steady_clock::time_point deadline) {
-    if (!initialized_ || !SupportsProviderQuery()) {
-        return ObjectStorageQueryResults(
-            logical_keys.size(),
-            tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
-    }
-    return object_storage_adapter_->BatchQueryProviderUntil(logical_keys,
-                                                            deadline);
-}
-
-ObjectStorageIoResults DistributedStorageBackend::BatchDeleteProvider(
+ObjectStorageIoResults DistributedStorageBackend::BatchDeleteObjects(
     std::span<const std::string> logical_keys) {
     if (!initialized_ || !UsesObjectStorage() || !object_storage_adapter_) {
         return ObjectStorageIoResults(
             logical_keys.size(),
             tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
     }
-    return object_storage_adapter_->BatchDelete(logical_keys);
+    return object_storage_adapter_->DeleteBatch(logical_keys);
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(

@@ -12,6 +12,37 @@
 #include "storage/distributed/dfs_allocator_interface.h"
 
 namespace mooncake {
+namespace {
+
+bool ValidateEvictionSettings(const DistributedStorageConfig& config) {
+    if (config.eviction_low_watermark < 0.0 ||
+        config.eviction_low_watermark > 1.0 ||
+        config.eviction_high_watermark < 0.0 ||
+        config.eviction_high_watermark > 1.0 ||
+        config.eviction_low_watermark >= config.eviction_high_watermark) {
+        LOG(ERROR) << "DistributedStorageConfig: eviction watermarks must "
+                      "satisfy 0 <= low < high <= 1, low="
+                   << config.eviction_low_watermark
+                   << ", high=" << config.eviction_high_watermark;
+        return false;
+    }
+    if (config.deferred_free_duration.count() < 0) {
+        LOG(ERROR) << "DistributedStorageConfig: deferred_free_duration must "
+                      "be non-negative, seconds="
+                   << config.deferred_free_duration.count();
+        return false;
+    }
+    if (config.eviction_enabled &&
+        config.eviction_check_interval.count() <= 0) {
+        LOG(ERROR) << "DistributedStorageConfig: eviction_check_interval must "
+                      "be positive when eviction is enabled, seconds="
+                   << config.eviction_check_interval.count();
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
 
 std::optional<DfsAllocatorType> ParseDfsAllocatorType(std::string_view name) {
     if (name == "shard") return DfsAllocatorType::SHARD;
@@ -31,17 +62,18 @@ const char* ToString(DfsAllocatorType type) {
 
 bool DistributedStorageConfig::Validate() const {
     if (UsesKvcs()) {
-        if (provider_query_timeout_ms == 0) {
-            LOG(ERROR) << "DistributedStorageConfig: provider query timeout "
-                          "must be positive";
-            return false;
-        }
         if (!single_tenant) {
             LOG(ERROR) << "DistributedStorageConfig: KVCS currently requires "
                           "single_tenant=true";
             return false;
         }
-        return true;
+        if (eviction_check_interval.count() <= 0) {
+            LOG(ERROR) << "DistributedStorageConfig: KVCS capacity check "
+                          "interval must be positive, seconds="
+                       << eviction_check_interval.count();
+            return false;
+        }
+        return ValidateEvictionSettings(*this);
     }
     if (fsdir.empty()) {
         LOG(ERROR) << "DistributedStorageConfig: fsdir is empty";
@@ -113,28 +145,7 @@ bool DistributedStorageConfig::ValidateForAllocator() const {
         return false;
     }
 
-    if (eviction_low_watermark < 0.0 || eviction_low_watermark > 1.0 ||
-        eviction_high_watermark < 0.0 || eviction_high_watermark > 1.0 ||
-        eviction_low_watermark >= eviction_high_watermark) {
-        LOG(ERROR) << "DistributedStorageConfig: eviction watermarks must "
-                      "satisfy 0 <= low < high <= 1, low="
-                   << eviction_low_watermark
-                   << ", high=" << eviction_high_watermark;
-        return false;
-    }
-    if (deferred_free_duration.count() < 0) {
-        LOG(ERROR) << "DistributedStorageConfig: deferred_free_duration must "
-                      "be non-negative, seconds="
-                   << deferred_free_duration.count();
-        return false;
-    }
-    if (eviction_enabled && eviction_check_interval.count() <= 0) {
-        LOG(ERROR) << "DistributedStorageConfig: eviction_check_interval must "
-                      "be positive when eviction is enabled, seconds="
-                   << eviction_check_interval.count();
-        return false;
-    }
-    return true;
+    return ValidateEvictionSettings(*this);
 }
 
 DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
@@ -155,23 +166,8 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         Environ::ReadOr(Variables::MOONCAKE_DFS_FS_ADAPTER, legacy_fs_adapter);
     config.allocator_type = Environ::ReadOr(Variables::MOONCAKE_DFS_ALLOCATOR,
                                             config.allocator_type);
-    const auto kvcs_mode = Environ::GetString("MOONCAKE_KVCS_MODE", "");
-    if (kvcs_mode == "low-level" || kvcs_mode == "kvcs") {
-        config.fs_adapter_type = "kvcs-lowlevel";
-    } else if (!kvcs_mode.empty()) {
-        config.fs_adapter_type = kvcs_mode;
-    }
-    config.object_storage_config_path = Environ::GetString(
-        "MOONCAKE_KVCS_EFC_CONFIG", config.object_storage_config_path);
-    const auto provider_query_timeout_ms = Environ::GetUInt64(
-        "MOONCAKE_KVCS_QUERY_TIMEOUT_MS", config.provider_query_timeout_ms);
-    if (provider_query_timeout_ms > std::numeric_limits<uint32_t>::max()) {
-        LOG(ERROR) << "MOONCAKE_KVCS_QUERY_TIMEOUT_MS exceeds uint32_t";
-        config.provider_query_timeout_ms = 0;
-    } else {
-        config.provider_query_timeout_ms =
-            static_cast<uint32_t>(provider_query_timeout_ms);
-    }
+    config.object_storage_config_path = Environ::ReadOr(
+        Variables::MOONCAKE_KVCS_EFC_CONFIG, config.object_storage_config_path);
     config.enable_health_check =
         Environ::ReadOr(Variables::MOONCAKE_DISTRIBUTED_HEALTH_CHECK,
                         config.fs_adapter_type == "kvcs-lowlevel" ||
@@ -186,11 +182,8 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         Variables::MOONCAKE_DFS_MAX_BUCKET_COUNT, config.max_bucket_count);
     config.alignment =
         Environ::ReadOr(Variables::MOONCAKE_DFS_ALIGNMENT, config.alignment);
-    config.single_tenant =
-        config.UsesKvcs()
-            ? Environ::GetBool("MOONCAKE_KVCS_SINGLE_TENANT", true)
-            : Environ::ReadOr(Variables::MOONCAKE_DFS_SINGLE_TENANT,
-                              config.single_tenant);
+    config.single_tenant = Environ::ReadOr(
+        Variables::MOONCAKE_DFS_SINGLE_TENANT, config.single_tenant);
     config.eviction_enabled = Environ::ReadOr(
         Variables::MOONCAKE_DFS_EVICTION_ENABLED, config.eviction_enabled);
 
@@ -228,8 +221,7 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", deferred_free_seconds=" << deferred_free_duration.count()
         << ", eviction_check_interval_seconds="
         << eviction_check_interval.count()
-        << ", object_storage_config_path=" << object_storage_config_path
-        << ", provider_query_timeout_ms=" << provider_query_timeout_ms;
+        << ", object_storage_config_path=" << object_storage_config_path;
     return oss.str();
 }
 

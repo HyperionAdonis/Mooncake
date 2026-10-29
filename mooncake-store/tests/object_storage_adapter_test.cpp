@@ -243,6 +243,8 @@ TEST_F(ObjectStorageAdapterTest, ObjectStorageModeInitSkipsDirectories) {
     FakeObjectStorageAdapter* adapter = nullptr;
     auto backend = MakeObjectStorageBackend(adapter);
 
+    EXPECT_EQ(backend->GetStorageMode(),
+              DistributedStorageMode::kObjectStorage);
     EXPECT_TRUE(backend->UsesObjectStorage());
     EXPECT_FALSE(backend->UsesKvcs());
     ASSERT_TRUE(backend->Init());
@@ -632,6 +634,7 @@ TEST_F(ObjectStorageAdapterTest, FileSystemModeKeepsDfsOnlyContract) {
     DistributedStorageBackend backend(file_config, distributed_config,
                                       std::move(owned_adapter));
 
+    EXPECT_EQ(backend.GetStorageMode(), DistributedStorageMode::kFileSystem);
     EXPECT_FALSE(backend.UsesObjectStorage());
 
     std::unordered_map<std::string, std::vector<Slice>> offload_batch;

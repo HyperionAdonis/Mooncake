@@ -50,6 +50,17 @@ struct OffloadingTask {
     std::vector<UUID> mirror_clients;
 };
 
+// A KVCS delete keeps the Master record as the name reservation while the
+// client removes the physical value. Replica IDs make End/Revoke conditional
+// on the exact metadata generation prepared by Start.
+struct RemovalTask {
+    UUID client_id;
+    std::chrono::system_clock::time_point start_time;
+    ReplicaID object_storage_replica_id;
+    std::vector<ReplicaID> replica_ids;
+    bool durable_cleanup_pending{false};
+};
+
 // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source
 // LOCAL_DISK replica is refcnt-pinned for the duration of the task
 // so it cannot be evicted.

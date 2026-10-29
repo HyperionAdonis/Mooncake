@@ -52,6 +52,8 @@
 #include "storage/distributed/shard_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
+#include "storage/distributed/kvcs/kvcs_efc_metrics.h"
+#include "storage/distributed/kvcs/kvcs_efc_target.h"
 #include "random.h"
 #include "kv_event/kv_event_config.h"
 #include "ha_metric_manager.h"
@@ -164,6 +166,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
               }
           }),
       replica_cleanup_worker_([this] { ClearInvalidHandles(); }),
+      kvcs_capacity_refresh_worker_([this] { RefreshKvcsDfsUsage(); }),
       enable_async_segment_cleanup_(!config.enable_ha && !config.enable_cxl),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
@@ -436,6 +439,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     // normally instead of encountering joinable thread destructors.
     client_offboarding_worker_.Start();
     VLOG(1) << "action=start_client_offboarding_worker";
+    if (dfs_kvcs_capacity_provider_) kvcs_capacity_refresh_worker_.Start();
 
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
@@ -522,8 +526,6 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         DfsEnablementConfig::FromEnvironment().enabled || dfs_config.UsesKvcs();
     if (!enable_dfs_) return;
 
-    // Legacy master snapshots were removed upstream, so oplog recovery is
-    // the only remaining path that cannot restore DFS allocator state.
     const bool recovery_enabled = enable_oplog_;
     if (!dfs_config.Validate()) {
         LOG(ERROR) << "Invalid distributed storage config: {"
@@ -548,6 +550,18 @@ void MasterService::InitDfsAllocatorFromEnvironment(
 
     if (dfs_config.UsesKvcs()) {
         dfs_kvcs_backend_ = dfs_config.fs_adapter_type;
+        auto target = LoadKvcsEfcTarget(dfs_config.object_storage_config_path);
+        if (!target) {
+            LOG(ERROR) << "Failed to load KVCS target capacity source";
+            enable_dfs_ = false;
+            dfs_kvcs_backend_.reset();
+            return;
+        }
+        dfs_kvcs_capacity_provider_ =
+            std::make_unique<KvcsEfcMetricsCapacityProvider>(
+                std::move(target->mountpoint_id),
+                std::move(target->metrics_endpoint));
+        dfs_kvcs_capacity_check_interval_ = dfs_config.eviction_check_interval;
         LOG(INFO) << "KVCS distributed object storage initialized without "
                      "DFS extent allocator, config={"
                   << dfs_config.FormatStr() << "}";
@@ -604,6 +618,7 @@ MasterService::~MasterService() {
     http_metadata_cleanup_running_ = false;
     graceful_unmount_scheduler_.Stop();
     replica_cleanup_worker_.Stop();
+    kvcs_capacity_refresh_worker_.Stop();
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
 #endif
@@ -684,6 +699,9 @@ TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
             .capacity_bytes = dfs_allocator_->GetTotalCapacity(),
             .file_count = dfs_allocator_->GetFileCount(),
         };
+    } else if (enable_dfs_ && dfs_kvcs_capacity_provider_) {
+        std::lock_guard lock(dfs_kvcs_usage_mutex_);
+        snapshot.dfs = dfs_kvcs_usage_;
     }
     return snapshot;
 }
@@ -6789,20 +6807,33 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
     auto& metadata = accessor.Get();
     const auto previous_kv_media = KvMediaSnapshot(metadata);
 
+    const bool supports_dfs_condition = replica_type == ReplicaType::DFS &&
+                                        expected_replica_id != nullptr &&
+                                        dfs_kvcs_backend_.has_value();
     if (replica_type != ReplicaType::DISK &&
-        replica_type != ReplicaType::LOCAL_DISK) {
+        replica_type != ReplicaType::LOCAL_DISK && !supports_dfs_condition) {
         LOG(ERROR) << "key=" << key
                    << ", error=invalid_replica_type_for_eviction";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto target_pred = [replica_type, &client_id](const Replica& r) {
+    auto target_pred = [this, replica_type, &client_id,
+                        expected_replica_id](const Replica& r) {
         if (replica_type == ReplicaType::DISK) {
             return r.is_disk_replica();
         } else if (replica_type == ReplicaType::LOCAL_DISK) {
             return r.is_local_disk_replica() &&
                    r.get_descriptor().get_local_disk_descriptor().client_id ==
                        client_id;
+        } else if (replica_type == ReplicaType::DFS) {
+            if (!r.is_dfs_replica() || expected_replica_id == nullptr ||
+                r.id() != *expected_replica_id) {
+                return false;
+            }
+            const auto& descriptor = r.get_dfs_descriptor();
+            return dfs_kvcs_backend_.has_value() &&
+                   descriptor.IsObjectStorage() &&
+                   descriptor.ObjectStorageBackend() == *dfs_kvcs_backend_;
         }
         return false;
     };
@@ -6839,8 +6870,7 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
                 persist_result = AppendReservedOpLogWithDurableFinalize(
                     std::move(reservation.value()), OpType::REMOVE,
                     metadata.tenant_id.value(), key, {},
-                    [this, removed_ids = std::move(removed_ids)](
-                        const OpLogEntry& durable_entry) {
+                    [this, removed_ids](const OpLogEntry& durable_entry) {
                         FinalizeRemovedReplicasAfterDurable(
                             durable_entry, removed_ids, QuotaEraseMode::kFull);
                     });
@@ -6850,14 +6880,19 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
                     metadata.tenant_id.value(), key,
                     SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
                                                                     remaining),
-                    [this, removed_ids = std::move(removed_ids)](
-                        const OpLogEntry& durable_entry) {
+                    [this, removed_ids](const OpLogEntry& durable_entry) {
                         FinalizeRemovedReplicasAfterDurable(
                             durable_entry, removed_ids, QuotaEraseMode::kFull);
                     });
             }
             if (!persist_result) {
-                return tl::make_unexpected(persist_result.error());
+                const auto error = persist_result.error();
+                for (ReplicaID id : removed_ids) {
+                    if (auto* replica = metadata.GetReplicaByID(id)) {
+                        replica->cancel_remove();
+                    }
+                }
+                return tl::make_unexpected(error);
             }
             return true;
         }
@@ -6878,7 +6913,7 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
         }
     }
 
-    if (replica_type == ReplicaType::DISK) {
+    if (replica_type == ReplicaType::DISK || replica_type == ReplicaType::DFS) {
         EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
     } else if (replica_type == ReplicaType::LOCAL_DISK) {
         bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
@@ -7822,6 +7857,212 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     return {};
 }
 
+std::vector<tl::expected<ReplicaID, ErrorCode>> MasterService::BatchRemoveStart(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const TenantId& tenant_id, bool force) {
+    std::vector<tl::expected<ReplicaID, ErrorCode>> results(
+        keys.size(), tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto object_id = MakeObjectIdentityForRequest(keys[i], tenant_id);
+        MetadataAccessorRW accessor(this, object_id);
+        if (!accessor.Exists()) {
+            results[i] = tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            continue;
+        }
+
+        auto& state = accessor.GetState();
+        if (state.removal_task) {
+            if (state.removal_task->client_id == client_id) {
+                results[i] = state.removal_task->object_storage_replica_id;
+            } else {
+                results[i] = tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+            continue;
+        }
+
+        auto& metadata = accessor.Get();
+        if (!force && !metadata.IsLeaseExpired()) {
+            results[i] = tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+            continue;
+        }
+        if (!metadata.AllReplicas(&Replica::fn_is_completed)) {
+            results[i] = tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+            continue;
+        }
+        if (state.HasWorkInFlight()) {
+            results[i] = tl::make_unexpected(
+                state.replication_task
+                    ? ErrorCode::OBJECT_HAS_REPLICATION_TASK
+                    : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            continue;
+        }
+
+        Replica* object_storage_replica =
+            metadata.GetFirstReplica([this](const Replica& replica) {
+                if (!replica.is_dfs_replica() || !dfs_kvcs_backend_) {
+                    return false;
+                }
+                const auto& descriptor = replica.get_dfs_descriptor();
+                return descriptor.IsObjectStorage() &&
+                       descriptor.ObjectStorageBackend() == *dfs_kvcs_backend_;
+            });
+        if (object_storage_replica == nullptr) {
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
+        }
+
+        std::vector<ReplicaID> replica_ids;
+        replica_ids.reserve(metadata.CountReplicas());
+        metadata.VisitReplicas([](const Replica&) { return true; },
+                               [&replica_ids](Replica& replica) {
+                                   replica_ids.push_back(replica.id());
+                                   replica.mark_removed();
+                               });
+        const ReplicaID object_storage_replica_id =
+            object_storage_replica->id();
+        state.removal_task =
+            RemovalTask{client_id, std::chrono::system_clock::now(),
+                        object_storage_replica_id, std::move(replica_ids)};
+        results[i] = object_storage_replica_id;
+    }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterService::BatchRemoveEnd(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<ReplicaID>& replica_ids, const TenantId& tenant_id) {
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    if (keys.size() != replica_ids.size()) return results;
+
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto object_id = MakeObjectIdentityForRequest(keys[i], tenant_id);
+        MetadataAccessorRW accessor(this, object_id);
+        if (!accessor.Exists()) {
+            results[i] = tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            continue;
+        }
+        auto& state = accessor.GetState();
+        if (!state.removal_task) {
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_WRITE);
+            continue;
+        }
+        auto& task = *state.removal_task;
+        if (task.client_id != client_id) {
+            results[i] = tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+            continue;
+        }
+        if (task.object_storage_replica_id != replica_ids[i]) {
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_VERSION);
+            continue;
+        }
+        if (task.durable_cleanup_pending) {
+            results[i] = {};
+            continue;
+        }
+
+        auto& metadata = accessor.Get();
+        const bool prepared =
+            std::all_of(task.replica_ids.begin(), task.replica_ids.end(),
+                        [&metadata](ReplicaID id) {
+                            const auto* replica = metadata.GetReplicaByID(id);
+                            return replica != nullptr &&
+                                   replica->status() == ReplicaStatus::REMOVED;
+                        });
+        if (!prepared) {
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_VERSION);
+            continue;
+        }
+
+        if (enable_ha_ && enable_oplog_) {
+            auto reservation = ReserveBatchOpLogSlot();
+            if (!reservation) {
+                results[i] = tl::make_unexpected(reservation.error());
+                continue;
+            }
+            task.durable_cleanup_pending = true;
+            auto removed_ids = task.replica_ids;
+            auto persist_result = AppendReservedOpLogWithDurableFinalize(
+                std::move(*reservation), OpType::REMOVE,
+                object_id.tenant_id.value(), keys[i], {},
+                [this, removed_ids = std::move(removed_ids)](
+                    const OpLogEntry& durable_entry) {
+                    FinalizeRemovedReplicasAfterDurable(
+                        durable_entry, removed_ids, QuotaEraseMode::kFull);
+                });
+            if (!persist_result) {
+                task.durable_cleanup_pending = false;
+                results[i] = tl::make_unexpected(persist_result.error());
+                continue;
+            }
+        } else {
+            accessor.Erase();
+        }
+        results[i] = {};
+    }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterService::BatchRemoveRevoke(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<ReplicaID>& replica_ids, const TenantId& tenant_id) {
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    if (keys.size() != replica_ids.size()) return results;
+
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto object_id = MakeObjectIdentityForRequest(keys[i], tenant_id);
+        MetadataAccessorRW accessor(this, object_id);
+        if (!accessor.Exists()) {
+            results[i] = tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            continue;
+        }
+        auto& state = accessor.GetState();
+        if (!state.removal_task) {
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_WRITE);
+            continue;
+        }
+        const auto& task = *state.removal_task;
+        if (task.client_id != client_id) {
+            results[i] = tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+            continue;
+        }
+        if (task.object_storage_replica_id != replica_ids[i]) {
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_VERSION);
+            continue;
+        }
+        if (task.durable_cleanup_pending) {
+            results[i] =
+                tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            continue;
+        }
+
+        auto& metadata = accessor.Get();
+        bool restored = true;
+        for (ReplicaID id : task.replica_ids) {
+            auto* replica = metadata.GetReplicaByID(id);
+            if (replica == nullptr ||
+                replica->status() != ReplicaStatus::REMOVED) {
+                restored = false;
+                break;
+            }
+        }
+        if (!restored) {
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_VERSION);
+            continue;
+        }
+        for (ReplicaID id : task.replica_ids)
+            metadata.GetReplicaByID(id)->cancel_remove();
+        state.removal_task.reset();
+        results[i] = {};
+    }
+    return results;
+}
+
 auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
                            bool force) -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
@@ -8708,6 +8949,20 @@ void MasterService::RunDfsEviction() {
         return;
     }
     RunShardDfsEviction();
+}
+
+void MasterService::RefreshKvcsDfsUsage() {
+    if (!dfs_kvcs_capacity_provider_) return;
+
+    auto capacity = dfs_kvcs_capacity_provider_->GetCapacity();
+    std::lock_guard lock(dfs_kvcs_usage_mutex_);
+    if (capacity) {
+        dfs_kvcs_usage_ = std::move(*capacity);
+    } else {
+        // Do not let a stale success drive a later watermark decision.
+        dfs_kvcs_usage_ = {};
+        VLOG(1) << "KVCS DFS capacity is unknown: " << capacity.error();
+    }
 }
 
 void MasterService::RunShardDfsEviction() {
@@ -11009,13 +11264,21 @@ void MasterService::EvictionThreadFunc() {
         }
 #endif
 
-        if (dfs_allocator_ && dfs_allocator_->IsEvictionEnabled()) {
+        if ((dfs_allocator_ && dfs_allocator_->IsEvictionEnabled()) ||
+            dfs_kvcs_capacity_provider_) {
             const auto steady_now = std::chrono::steady_clock::now();
             if (steady_now >= next_dfs_eviction_time) {
-                RunDfsEviction();
+                const auto interval =
+                    dfs_kvcs_capacity_provider_
+                        ? dfs_kvcs_capacity_check_interval_
+                        : dfs_allocator_->GetEvictionCheckInterval();
+                if (dfs_kvcs_capacity_provider_) {
+                    kvcs_capacity_refresh_worker_.Schedule();
+                } else {
+                    RunDfsEviction();
+                }
                 next_dfs_eviction_time =
-                    std::chrono::steady_clock::now() +
-                    dfs_allocator_->GetEvictionCheckInterval();
+                    std::chrono::steady_clock::now() + interval;
             }
         }
 
@@ -11264,6 +11527,27 @@ void MasterService::DiscardExpiredProcessingReplicas(
                                    task->pending_quota_charge_bytes);
                 task.reset();
             }
+        }
+
+        // A prepared KVCS removal is transient Master state. If the client
+        // disappears before End/Revoke, restore the exact replicas hidden by
+        // Start. If the physical delete did happen, the normal read-miss
+        // reconciliation will conditionally remove this metadata afterwards.
+        for (const auto& it : in_flight) {
+            if (it == objects.end()) continue;
+            auto& task = it->second.state.removal_task;
+            if (!task || task->durable_cleanup_pending ||
+                task->start_time + put_start_release_timeout_sec_ > now) {
+                continue;
+            }
+            for (ReplicaID id : task->replica_ids) {
+                auto* replica = it->second.metadata.GetReplicaByID(id);
+                if (replica != nullptr &&
+                    replica->status() == ReplicaStatus::REMOVED) {
+                    replica->cancel_remove();
+                }
+            }
+            task.reset();
         }
 
         for (const auto& it : in_flight) {

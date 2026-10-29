@@ -1,6 +1,5 @@
 #pragma once
 
-#include <algorithm>
 #include <boost/functional/hash.hpp>
 #include <deque>
 #include <queue>
@@ -10,7 +9,6 @@
 #include <unordered_set>
 #include <ostream>
 #include "types.h"
-#include "replica.h"
 #include "mutex.h"
 #include "master_config.h"
 

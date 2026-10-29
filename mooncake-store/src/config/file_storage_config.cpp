@@ -1,6 +1,5 @@
 #include "storage_backend.h"
 
-#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <locale>

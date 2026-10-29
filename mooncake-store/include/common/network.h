@@ -27,7 +27,8 @@ class AutoPortBinder {
     int port_;
 };
 
-tl::expected<std::string, int> httpGet(const std::string& url);
+tl::expected<std::string, int> httpGet(const std::string& url,
+                                       std::chrono::milliseconds timeout = {});
 
 // Sends an HTTP DELETE. Succeeds only on status 200; otherwise the error
 // describes the network failure or the HTTP status and response body.

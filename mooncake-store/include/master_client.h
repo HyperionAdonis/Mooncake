@@ -358,6 +358,15 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchRemove(
         const std::vector<std::string>& keys, bool force = false);
 
+    [[nodiscard]] std::vector<tl::expected<ReplicaID, ErrorCode>>
+    BatchRemoveStart(const std::vector<std::string>& keys, bool force = false);
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchRemoveEnd(
+        const std::vector<std::string>& keys,
+        const std::vector<ReplicaID>& replica_ids);
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchRemoveRevoke(
+        const std::vector<std::string>& keys,
+        const std::vector<ReplicaID>& replica_ids);
+
     /**
      * @brief Registers a segment to master for allocation
      * @param segment Segment to register
@@ -703,7 +712,8 @@ class MasterClient {
      * was never enforced.
      * @param key The object key whose disk replica was evicted
      * @param tenant_id The tenant scope of the object
-     * @param replica_type DISK or LOCAL_DISK
+     * @param replica_type DISK, LOCAL_DISK, or DFS. DFS is accepted only for
+     * a KVCS object-storage replica through this conditional API.
      * @param expected_replica_id The replica id the caller failed on
      * @return true if evicted, false if the current record is a different
      * replica (left untouched)

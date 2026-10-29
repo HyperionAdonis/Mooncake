@@ -13,9 +13,9 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     config/distributed_storage_config.cpp
     config/rpc_protocol_config.cpp
     config/store_cluster_identity_config.cpp
-    storage/distributed/object_storage_adapter.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
+    storage/distributed/kvcs/kvcs_efc_target.cpp
     common/file_util.cpp)
 
 set(MOONCAKE_STORE_MASTER_SOURCES
@@ -59,6 +59,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     serialize/serializer.cpp
     storage/distributed/shard_allocator.cpp
     storage/distributed/immutable_bucket_allocator.cpp
+    storage/distributed/kvcs/kvcs_efc_metrics.cpp
     ha/leadership/leader_coordinator_factory.cpp
     ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
     ha/common/redis/redis_connection.cpp
@@ -106,7 +107,6 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
-    storage/distributed/kvcs/kvcs_efc_topology.cpp
     storage/distributed/kvcs/kvcs_capi_driver.cpp
     storage/distributed/kvcs/kvcs_object_storage_adapter.cpp
     nvme_kv/backend.cpp
@@ -173,25 +173,22 @@ endif()
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
 
-# KVCS is optional so community builds without the vendor SDK continue to
-# work. The C API driver supplies an explicit NOT_SUPPORTED stub in that case.
+# KVCS is optional so community builds without the vendor SDK continue to work.
+# The C API driver supplies an explicit NOT_SUPPORTED stub in that case.
 set(MOONCAKE_KVCS_SDK_FOUND OFF)
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
   pkg_check_modules(KVCS QUIET IMPORTED_TARGET kvcs)
 endif()
-find_package(OpenSSL QUIET)
-if(TARGET PkgConfig::KVCS AND TARGET OpenSSL::Crypto)
+if(TARGET PkgConfig::KVCS)
   set(MOONCAKE_KVCS_SDK_FOUND ON)
   message(STATUS "KVCS SDK found: low-level adapter enabled")
 else()
-  message(STATUS "KVCS SDK not found: low-level adapter builds with unsupported stub")
+  message(
+    STATUS "KVCS SDK not found: low-level adapter builds with unsupported stub")
 endif()
 set(MOONCAKE_KVCS_SDK_FOUND
     ${MOONCAKE_KVCS_SDK_FOUND}
-    PARENT_SCOPE)
-set(MOONCAKE_KVCS_INCLUDE_DIRS
-    ${KVCS_INCLUDE_DIRS}
     PARENT_SCOPE)
 
 # RISC-V toolchains may implement 16-byte atomic operations in libatomic rather
@@ -491,6 +488,7 @@ target_link_libraries(
   PRIVATE cachelib_memory_allocator
           glog::glog
           gflags::gflags
+          yaml-cpp
           mooncake_common
           $<$<PLATFORM_ID:Linux>:numa>
           asio_shared
@@ -569,8 +567,7 @@ target_link_libraries(
 if(MOONCAKE_KVCS_SDK_FOUND)
   target_compile_definitions(mooncake_store_client_objects
                              PRIVATE MOONCAKE_HAVE_KVCS_SDK=1)
-  target_link_libraries(mooncake_store_client_objects
-                        PRIVATE PkgConfig::KVCS OpenSSL::Crypto)
+  target_link_libraries(mooncake_store_client_objects PRIVATE PkgConfig::KVCS)
 endif()
 if(BUILD_UNIT_TESTS)
   target_compile_definitions(mooncake_store_client_objects

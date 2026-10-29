@@ -988,6 +988,45 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
     return results;
 }
 
+std::vector<tl::expected<ReplicaID, ErrorCode>>
+WrappedMasterService::BatchRemoveStart(const UUID& client_id,
+                                       const std::vector<std::string>& keys,
+                                       bool force,
+                                       const std::string& tenant_id) {
+    return WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        keys.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchRemoveStart(client_id, keys,
+                                                    resolved_tenant_id, force);
+        });
+}
+
+std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemoveEnd(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<ReplicaID>& replica_ids, const std::string& tenant_id) {
+    return WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        keys.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchRemoveEnd(client_id, keys, replica_ids,
+                                                  resolved_tenant_id);
+        });
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchRemoveRevoke(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<ReplicaID>& replica_ids, const std::string& tenant_id) {
+    return WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        keys.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchRemoveRevoke(
+                client_id, keys, replica_ids, resolved_tenant_id);
+        });
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::MountSegment(
     const Segment& segment, const UUID& client_id) {
     return execute_rpc(
@@ -1897,6 +1936,12 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::RemoveAll>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchRemove>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchRemoveStart>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchRemoveEnd>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchRemoveRevoke>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::MountSegment>(
         &wrapped_master_service);
