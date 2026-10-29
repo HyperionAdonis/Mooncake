@@ -81,7 +81,6 @@ ErrorCode CallError(int status) {
         case KVCS_NAMESPACE_NOT_FOUND:
             return ErrorCode::OBJECT_NOT_FOUND;
         case KVCS_INCOMPLETE:
-            return ErrorCode::DFS_SERVICE_UNAVAILABLE;
         case KVCS_UNAVAILABLE:
         case KVCS_INVALID_MOUNT_POINT:
             return ErrorCode::DFS_SERVICE_UNAVAILABLE;
@@ -142,13 +141,32 @@ Results Errors(size_t count, ErrorCode error) {
     return results;
 }
 
+template <typename T, typename IsValid>
+std::vector<size_t> CollectValidIndices(std::span<const T> items,
+                                        IsValid&& is_valid,
+                                        KvcsIoResults& results) {
+    std::vector<size_t> indices;
+    indices.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (is_valid(items[i]))
+            indices.push_back(i);
+        else
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return indices;
+}
+
+void SetBatchError(KvcsIoResults& results, const std::vector<size_t>& indices,
+                   size_t begin, size_t count, ErrorCode error) {
+    for (size_t i = 0; i < count; ++i)
+        results[indices[begin + i]] = tl::make_unexpected(error);
+}
+
 tl::expected<void, ErrorCode> QueryStatus(std::string_view status) {
     if (status == "ok") return {};
     if (status == "not_found")
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    if (status == "incomplete")
-        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-    if (status == "unavailable")
+    if (status == "incomplete" || status == "unavailable")
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     if (status == "timeout") return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
     return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -187,14 +205,12 @@ class KvcsLowLevelDriver final : public KvcsDriver {
             return Errors<KvcsIoResults>(keys.size(),
                                          ErrorCode::INTERNAL_ERROR);
         KvcsIoResults results(keys.size());
-        std::vector<size_t> valid_indices;
-        valid_indices.reserve(keys.size());
-        for (size_t i = 0; i < keys.size(); ++i) {
-            if (IsKvcsKeyStringSafe(keys[i], config_.max_key_size))
-                valid_indices.push_back(i);
-            else
-                results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
+        auto valid_indices = CollectValidIndices(
+            keys,
+            [this](const ObjectKey& key) {
+                return IsKvcsKeyStringSafe(key, config_.max_key_size);
+            },
+            results);
 
         const size_t limit = static_cast<size_t>(config_.max_keys_per_batch);
         for (size_t begin = 0; begin < valid_indices.size(); begin += limit) {
@@ -208,16 +224,14 @@ class KvcsLowLevelDriver final : public KvcsDriver {
                 native.data(), static_cast<int>(count),
                 DeadlineNs(config_.operation_timeout_ms), &options_);
             if (returned < 0) {
-                for (size_t i = 0; i < count; ++i)
-                    results[valid_indices[begin + i]] =
-                        tl::make_unexpected(CallError(returned));
+                SetBatchError(results, valid_indices, begin, count,
+                              CallError(returned));
                 continue;
             }
             // The SDK returns either 0 or the requested item count on success.
             if (returned != 0 && returned != static_cast<int>(count)) {
-                for (size_t i = 0; i < count; ++i)
-                    results[valid_indices[begin + i]] =
-                        tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                SetBatchError(results, valid_indices, begin, count,
+                              ErrorCode::INTERNAL_ERROR);
             } else {
                 for (size_t i = 0; i < count; ++i) {
                     const auto status = std::string_view(
@@ -239,14 +253,9 @@ class KvcsLowLevelDriver final : public KvcsDriver {
             return Errors<KvcsIoResults>(requests.size(),
                                          ErrorCode::INTERNAL_ERROR);
         KvcsIoResults results(requests.size());
-        std::vector<size_t> valid_indices;
-        valid_indices.reserve(requests.size());
-        for (size_t i = 0; i < requests.size(); ++i) {
-            if (Valid(requests[i]))
-                valid_indices.push_back(i);
-            else
-                results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
+        auto valid_indices = CollectValidIndices(
+            requests, [this](const auto& request) { return Valid(request); },
+            results);
 
         const size_t limit = static_cast<size_t>(config_.max_keys_per_batch);
         for (size_t begin = 0; begin < valid_indices.size(); begin += limit) {
@@ -273,9 +282,8 @@ class KvcsLowLevelDriver final : public KvcsDriver {
                 static_cast<int>(count),
                 DeadlineNs(config_.operation_timeout_ms), &options_);
             if (call < 0) {
-                for (size_t i = 0; i < count; ++i)
-                    results[valid_indices[begin + i]] =
-                        tl::make_unexpected(CallError(call));
+                SetBatchError(results, valid_indices, begin, count,
+                              CallError(call));
                 continue;
             }
             for (size_t i = 0; i < count; ++i) {
@@ -295,14 +303,9 @@ class KvcsLowLevelDriver final : public KvcsDriver {
             return Errors<KvcsIoResults>(requests.size(),
                                          ErrorCode::INTERNAL_ERROR);
         KvcsIoResults results(requests.size());
-        std::vector<size_t> valid_indices;
-        valid_indices.reserve(requests.size());
-        for (size_t i = 0; i < requests.size(); ++i) {
-            if (Valid(requests[i]))
-                valid_indices.push_back(i);
-            else
-                results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
+        auto valid_indices = CollectValidIndices(
+            requests, [this](const auto& request) { return Valid(request); },
+            results);
 
         const size_t limit = static_cast<size_t>(config_.max_keys_per_batch);
         for (size_t begin = 0; begin < valid_indices.size(); begin += limit) {
@@ -328,9 +331,8 @@ class KvcsLowLevelDriver final : public KvcsDriver {
                 capacities.data(), statuses.data(), lengths.data(),
                 DeadlineNs(config_.operation_timeout_ms), &options_);
             if (call < 0) {
-                for (size_t i = 0; i < count; ++i)
-                    results[valid_indices[begin + i]] =
-                        tl::make_unexpected(CallError(call));
+                SetBatchError(results, valid_indices, begin, count,
+                              CallError(call));
                 continue;
             }
             for (size_t i = 0; i < count; ++i) {
@@ -369,14 +371,12 @@ class KvcsLowLevelDriver final : public KvcsDriver {
             return Errors<KvcsIoResults>(keys.size(),
                                          ErrorCode::INTERNAL_ERROR);
         KvcsIoResults results(keys.size());
-        std::vector<size_t> valid_indices;
-        valid_indices.reserve(keys.size());
-        for (size_t i = 0; i < keys.size(); ++i) {
-            if (IsKvcsKeyStringSafe(keys[i], config_.max_key_size))
-                valid_indices.push_back(i);
-            else
-                results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
+        auto valid_indices = CollectValidIndices(
+            keys,
+            [this](const ObjectKey& key) {
+                return IsKvcsKeyStringSafe(key, config_.max_key_size);
+            },
+            results);
 
         const size_t limit = static_cast<size_t>(config_.max_keys_per_batch);
         for (size_t begin = 0; begin < valid_indices.size(); begin += limit) {
@@ -390,9 +390,8 @@ class KvcsLowLevelDriver final : public KvcsDriver {
                 statuses.data(), static_cast<int>(count),
                 DeadlineNs(config_.operation_timeout_ms), &options_);
             if (call < 0) {
-                for (size_t i = 0; i < count; ++i)
-                    results[valid_indices[begin + i]] =
-                        tl::make_unexpected(CallError(call));
+                SetBatchError(results, valid_indices, begin, count,
+                              CallError(call));
                 continue;
             }
             for (size_t i = 0; i < count; ++i) {

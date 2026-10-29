@@ -4,6 +4,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include <glog/logging.h>
+
 #include "storage/distributed/kvcs/kvcs_capi_driver.h"
 #include "storage/distributed/kvcs/kvcs_efc_target.h"
 
@@ -21,8 +23,26 @@ std::vector<tl::expected<T, ErrorCode>> Errors(size_t count, ErrorCode error) {
     return results;
 }
 
-ObjectStorageIoResults IoErrors(size_t count, ErrorCode error) {
-    return Errors<void>(count, error);
+template <typename T, typename Call, typename Convert>
+void RunKvcsBatch(const std::vector<size_t>& request_indices,
+                  std::vector<tl::expected<T, ErrorCode>>& results, Call&& call,
+                  Convert&& convert) {
+    if (request_indices.empty()) return;
+    try {
+        auto driver_results = call();
+        if (driver_results.size() != request_indices.size()) {
+            for (size_t index : request_indices)
+                results[index] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            return;
+        }
+        for (size_t i = 0; i < driver_results.size(); ++i) {
+            results[request_indices[i]] =
+                convert(std::move(driver_results[i]), request_indices[i]);
+        }
+    } catch (...) {
+        for (size_t index : request_indices)
+            results[index] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
 }
 
 }  // namespace
@@ -32,7 +52,7 @@ KvcsObjectStorageAdapter::KvcsObjectStorageAdapter(std::string efc_config_path)
 
 KvcsObjectStorageAdapter::KvcsObjectStorageAdapter(
     std::unique_ptr<KvcsDriver> driver)
-    : mountpoint_index_(1), driver_(std::move(driver)) {}
+    : driver_(std::move(driver)) {}
 
 KvcsObjectStorageAdapter::~KvcsObjectStorageAdapter() = default;
 
@@ -48,6 +68,7 @@ tl::expected<ObjectKey, ErrorCode> KvcsObjectStorageAdapter::EncodeKey(
 
 tl::expected<void, ErrorCode> KvcsObjectStorageAdapter::Init() {
     if (initialized_) return {};
+    uint32_t mountpoint_index = 1;
     std::string mountpoint_id = "injected";
     if (!driver_) {
         auto target = LoadKvcsEfcTarget(efc_config_path_);
@@ -55,7 +76,7 @@ tl::expected<void, ErrorCode> KvcsObjectStorageAdapter::Init() {
         auto driver = CreateKvcsLowLevelDriver(target->mountpoint_index);
         if (!driver) return tl::make_unexpected(driver.error());
         mountpoint_id = std::move(target->mountpoint_id);
-        mountpoint_index_ = target->mountpoint_index;
+        mountpoint_index = target->mountpoint_index;
         driver_ = std::move(*driver);
     }
     if (!driver_) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -67,7 +88,7 @@ tl::expected<void, ErrorCode> KvcsObjectStorageAdapter::Init() {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     initialized_ = true;
     LOG(INFO) << "KVCS Low Level mountpoint_id=" << mountpoint_id
-              << ", mountpoint_index=" << mountpoint_index_;
+              << ", mountpoint_index=" << mountpoint_index;
     return {};
 }
 
@@ -99,7 +120,7 @@ tl::expected<void, ErrorCode> KvcsObjectStorageAdapter::PutV(
 std::vector<tl::expected<void, ErrorCode>> KvcsObjectStorageAdapter::PutBatch(
     const std::vector<ObjectPutRequest>& requests) {
     if (!initialized_)
-        return IoErrors(requests.size(), ErrorCode::INTERNAL_ERROR);
+        return Errors<void>(requests.size(), ErrorCode::INTERNAL_ERROR);
     ObjectStorageIoResults results(requests.size());
     std::vector<KvcsIoRequest> puts;
     std::vector<size_t> put_indices;
@@ -143,19 +164,9 @@ std::vector<tl::expected<void, ErrorCode>> KvcsObjectStorageAdapter::PutBatch(
         put_indices.push_back(i);
     }
 
-    try {
-        auto put_results = driver_->BatchPut(puts);
-        if (put_results.size() != puts.size()) {
-            for (size_t index : put_indices)
-                results[index] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            return results;
-        }
-        for (size_t i = 0; i < put_results.size(); ++i)
-            results[put_indices[i]] = std::move(put_results[i]);
-    } catch (...) {
-        for (size_t index : put_indices)
-            results[index] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
+    RunKvcsBatch<void>(
+        put_indices, results, [&] { return driver_->BatchPut(puts); },
+        [](auto result, size_t) { return result; });
     return results;
 }
 
@@ -187,26 +198,13 @@ std::vector<tl::expected<size_t, ErrorCode>> KvcsObjectStorageAdapter::GetBatch(
             {std::move(*key), {{request.buffer, request.size}}, request.size});
         get_indices.push_back(i);
     }
-    try {
-        auto get_results = driver_->BatchGet(gets);
-        if (get_results.size() != gets.size()) {
-            for (size_t index : get_indices)
-                results[index] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            return results;
-        }
-        for (size_t i = 0; i < get_results.size(); ++i) {
-            const size_t request_index = get_indices[i];
-            results[request_index] =
-                get_results[i]
-                    ? tl::expected<size_t, ErrorCode>(
-                          requests[request_index].size)
-                    : tl::expected<size_t, ErrorCode>(
-                          tl::make_unexpected(get_results[i].error()));
-        }
-    } catch (...) {
-        for (size_t index : get_indices)
-            results[index] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
+    RunKvcsBatch<size_t>(
+        get_indices, results, [&] { return driver_->BatchGet(gets); },
+        [&](auto result,
+            size_t request_index) -> tl::expected<size_t, ErrorCode> {
+            if (!result) return tl::make_unexpected(result.error());
+            return requests[request_index].size;
+        });
     return results;
 }
 
@@ -236,7 +234,8 @@ tl::expected<void, ErrorCode> KvcsObjectStorageAdapter::Delete(
 
 ObjectStorageIoResults KvcsObjectStorageAdapter::DeleteBatch(
     std::span<const std::string> keys) {
-    if (!initialized_) return IoErrors(keys.size(), ErrorCode::INTERNAL_ERROR);
+    if (!initialized_)
+        return Errors<void>(keys.size(), ErrorCode::INTERNAL_ERROR);
     ObjectStorageIoResults results(keys.size());
     std::vector<ObjectKey> encoded_keys;
     std::vector<size_t> delete_indices;
@@ -251,19 +250,10 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::DeleteBatch(
         encoded_keys.push_back(std::move(*encoded));
         delete_indices.push_back(i);
     }
-    try {
-        auto delete_results = driver_->BatchDelete(encoded_keys);
-        if (delete_results.size() != encoded_keys.size()) {
-            for (size_t index : delete_indices)
-                results[index] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            return results;
-        }
-        for (size_t i = 0; i < delete_results.size(); ++i)
-            results[delete_indices[i]] = std::move(delete_results[i]);
-    } catch (...) {
-        for (size_t index : delete_indices)
-            results[index] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
+    RunKvcsBatch<void>(
+        delete_indices, results,
+        [&] { return driver_->BatchDelete(encoded_keys); },
+        [](auto result, size_t) { return result; });
     return results;
 }
 

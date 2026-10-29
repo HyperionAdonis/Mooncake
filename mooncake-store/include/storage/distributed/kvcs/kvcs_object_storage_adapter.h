@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -48,7 +47,6 @@ class KvcsObjectStorageAdapter final : public ObjectStorageAdapter {
         std::string_view logical_key) const;
 
     std::string efc_config_path_;
-    uint32_t mountpoint_index_ = 0;
     std::unique_ptr<KvcsDriver> driver_;
     bool initialized_ = false;
 };

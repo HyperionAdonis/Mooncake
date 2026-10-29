@@ -418,6 +418,19 @@ FinalizeDecision DetermineFinalizeDecision(
                          : summary.first_error};
 }
 
+std::optional<ReplicaID> FindDfsReplicaId(
+    std::span<const Replica::Descriptor> replicas) {
+    auto replica = std::find_if(
+        replicas.begin(), replicas.end(),
+        [](const Replica::Descriptor& item) { return item.is_dfs_replica(); });
+    if (replica == replicas.end()) return std::nullopt;
+    return replica->id;
+}
+
+bool IsIdempotentDeleteSuccess(const tl::expected<void, ErrorCode>& result) {
+    return result || result.error() == ErrorCode::OBJECT_NOT_FOUND;
+}
+
 // A KVCS value must not survive a failed or ambiguous write. Reuse the existing
 // primary-write revoke while the replica is PROCESSING; if PutEnd actually
 // committed and only its response was lost, reuse the existing conditional
@@ -442,8 +455,7 @@ void CleanupKvcsFailedPut(
     retry_indices.reserve(objects.size());
     retry_keys.reserve(objects.size());
     for (size_t i = 0; i < objects.size(); ++i) {
-        if (i < deleted.size() &&
-            (deleted[i] || deleted[i].error() == ErrorCode::OBJECT_NOT_FOUND)) {
+        if (i < deleted.size() && IsIdempotentDeleteSuccess(deleted[i])) {
             physically_removed[i] = true;
             continue;
         }
@@ -457,8 +469,7 @@ void CleanupKvcsFailedPut(
         }
         for (size_t i = 0; i < std::min(retries.size(), retry_keys.size());
              ++i) {
-            if (retries[i] ||
-                retries[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
+            if (IsIdempotentDeleteSuccess(retries[i])) {
                 physically_removed[retry_indices[i]] = true;
             } else {
                 LOG(ERROR) << "Failed to remove KVCS value after Put failure, "
@@ -2201,14 +2212,9 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             ErrorCode err = end_result.error();
             if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs() &&
                 transfer_summary.successful_dfs_transfers > 0) {
-                auto dfs_replica =
-                    std::find_if(start_result->begin(), start_result->end(),
-                                 [](const Replica::Descriptor& replica) {
-                                     return replica.is_dfs_replica();
-                                 });
-                if (dfs_replica != start_result->end()) {
+                if (auto replica_id = FindDfsReplicaId(*start_result)) {
                     const std::array<std::pair<std::string, ReplicaID>, 1>
-                        cleanup{{key, dfs_replica->id}};
+                        cleanup{{{key, *replica_id}}};
                     CleanupKvcsFailedPut(*dfs_storage_backend_, master_client_,
                                          cleanup);
                 }
@@ -2225,14 +2231,9 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         if (!finalize_decision.success && dfs_storage_backend_ &&
             dfs_storage_backend_->UsesKvcs() &&
             transfer_summary.failed_dfs_transfers > 0) {
-            auto dfs_replica =
-                std::find_if(start_result->begin(), start_result->end(),
-                             [](const Replica::Descriptor& replica) {
-                                 return replica.is_dfs_replica();
-                             });
-            if (dfs_replica != start_result->end()) {
+            if (auto replica_id = FindDfsReplicaId(*start_result)) {
                 const std::array<std::pair<std::string, ReplicaID>, 1> cleanup{
-                    {{key, dfs_replica->id}}};
+                    {{key, *replica_id}}};
                 CleanupKvcsFailedPut(*dfs_storage_backend_, master_client_,
                                      cleanup);
                 return tl::unexpected(finalize_decision.error);
@@ -3309,13 +3310,8 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
             finalize_decision.revoke_type == ReplicaType::ALL &&
             dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs() &&
             op.transfer_summary.failed_dfs_transfers > 0) {
-            auto dfs_replica =
-                std::find_if(op.replicas.begin(), op.replicas.end(),
-                             [](const Replica::Descriptor& replica) {
-                                 return replica.is_dfs_replica();
-                             });
-            if (dfs_replica != op.replicas.end()) {
-                failed_kvcs_puts.emplace_back(op.key, dfs_replica->id);
+            if (auto replica_id = FindDfsReplicaId(op.replicas)) {
+                failed_kvcs_puts.emplace_back(op.key, *replica_id);
                 cleanup_failed_kvcs_put = true;
             }
         }
@@ -3432,13 +3428,9 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
                 ops[i].transfer_summary.successful_dfs_transfers == 0) {
                 continue;
             }
-            auto dfs_replica =
-                std::find_if(ops[i].replicas.begin(), ops[i].replicas.end(),
-                             [](const Replica::Descriptor& replica) {
-                                 return replica.is_dfs_replica();
-                             });
-            if (dfs_replica == ops[i].replicas.end()) continue;
-            cleanup.emplace_back(ops[i].key, dfs_replica->id);
+            auto replica_id = FindDfsReplicaId(ops[i].replicas);
+            if (!replica_id) continue;
+            cleanup.emplace_back(ops[i].key, *replica_id);
         }
         CleanupKvcsFailedPut(*dfs_storage_backend_, master_client_, cleanup);
     }
@@ -4037,8 +4029,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
         std::vector<ReplicaID> revoke_ids;
         for (size_t i = 0; i < prepared_keys.size(); ++i) {
             const size_t result_index = prepared_indices[i];
-            if (!delete_results[i] &&
-                delete_results[i].error() != ErrorCode::OBJECT_NOT_FOUND) {
+            if (!IsIdempotentDeleteSuccess(delete_results[i])) {
                 results[result_index] =
                     tl::make_unexpected(delete_results[i].error());
                 revoke_keys.push_back(prepared_keys[i]);

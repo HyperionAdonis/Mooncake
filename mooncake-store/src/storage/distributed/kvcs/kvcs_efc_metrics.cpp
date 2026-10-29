@@ -29,7 +29,8 @@ tl::expected<PrometheusSample, std::string> ParseSample(std::string_view line) {
     const size_t name_end = line.find_first_of("{ \t");
     if (name_end == std::string_view::npos)
         return tl::make_unexpected("missing metric value");
-    PrometheusSample sample{.name = line.substr(0, name_end)};
+    PrometheusSample sample{
+        .name = line.substr(0, name_end), .labels = {}, .value = {}};
     size_t pos = name_end;
     if (line[pos] == '{') {
         ++pos;

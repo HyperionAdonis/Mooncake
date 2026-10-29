@@ -139,12 +139,9 @@ tl::expected<void, ErrorCode> TransferAll(FileSystemAdapter& adapter, int fd,
 bool IsObjectDescriptorValid(const DistributedFSDescriptor& desc,
                              const DistributedStorageConfig& config,
                              const ObjectStorageAdapter& adapter) {
-    if (!desc.IsObjectStorage() || desc.object_size == 0 ||
-        desc.ObjectStorageBackend() != adapter.GetName() ||
-        desc.ObjectStorageBackend() != config.fs_adapter_type) {
-        return false;
-    }
-    return true;
+    return desc.IsObjectStorage() && desc.object_size != 0 &&
+           desc.ObjectStorageBackend() == adapter.GetName() &&
+           desc.ObjectStorageBackend() == config.fs_adapter_type;
 }
 
 tl::expected<uint64_t, ErrorCode> CalculateSliceBytes(

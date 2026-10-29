@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <algorithm>
 #include <bitset>
 #include <cassert>
 #include <cctype>
@@ -691,6 +690,7 @@ TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
     TieredStorageUsageSnapshot snapshot{
         .memory = segment_manager_.GetMemoryUsageSnapshot(),
         .nof = nof_segment_manager_.GetUsageSnapshot(),
+        .dfs = {},
     };
     if (enable_dfs_ && dfs_allocator_ && dfs_allocator_->IsInitialized()) {
         snapshot.dfs = {
@@ -3305,6 +3305,15 @@ std::pair<TenantId, std::string> ResolveStandbyObject(
     return std::make_pair(std::move(tenant_id), std::move(user_key));
 }
 
+bool IsCompatibleObjectStorageDfsDescriptor(
+    const DistributedFSDescriptor& descriptor,
+    const std::optional<std::string>& configured_backend,
+    uint64_t expected_size) {
+    return configured_backend && descriptor.IsObjectStorage() &&
+           descriptor.ObjectStorageBackend() == *configured_backend &&
+           descriptor.object_size == expected_size;
+}
+
 }  // namespace
 
 struct PreparedObject {
@@ -3624,6 +3633,16 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                     local_disk_desc.transport_endpoint, desc.status,
                     RecordRestoreKnownOwner(ctx.new_known_owner_records,
                                             local_disk_desc.client_id)));
+            } else if (desc.is_dfs_replica()) {
+                const auto& dfs_desc = desc.get_dfs_descriptor();
+                if (!IsCompatibleObjectStorageDfsDescriptor(
+                        dfs_desc, dfs_kvcs_backend_, standby_meta.size)) {
+                    NoteLegacyStandbyRejection(
+                        ctx, entry, "invalid_dfs_object_storage_descriptor");
+                    construction_ok = false;
+                    break;
+                }
+                replicas.push_back(Replica(desc.id, dfs_desc, desc.status));
             } else {
                 LOG(ERROR) << "RestoreFromStandbySnapshot: unsupported replica "
                            << "descriptor, tenant="
@@ -4088,9 +4107,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                         record_for_known_owner(local_disk_desc.client_id)));
                 } else if (desc.is_dfs_replica()) {
                     const auto& dfs_desc = desc.get_dfs_descriptor();
-                    if (!dfs_kvcs_backend_ || !dfs_desc.IsObjectStorage() ||
-                        dfs_desc.ObjectStorageBackend() != *dfs_kvcs_backend_ ||
-                        dfs_desc.object_size != standby_meta.size) {
+                    if (!IsCompatibleObjectStorageDfsDescriptor(
+                            dfs_desc, dfs_kvcs_backend_, standby_meta.size)) {
                         LOG(ERROR)
                             << "RestoreFromStandbySnapshot: invalid DFS "
                                "object-storage descriptor, tenant="
@@ -6838,10 +6856,7 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
         return false;
     };
 
-    if (expected_replica_id != nullptr &&
-        !metadata.HasReplica([&](const Replica& r) {
-            return target_pred(r) && r.id() == *expected_replica_id;
-        })) {
+    if (expected_replica_id != nullptr && !metadata.HasReplica(target_pred)) {
         // The replica the caller failed on is no longer the current record:
         // it was replaced or already evicted. Leave whatever is there now
         // untouched and report the precondition miss.
@@ -6853,64 +6868,46 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
     if (enable_oplog_ && ordered_oplog_writer_) {
         auto remaining =
             BuildRemainingReplicaDescriptors(metadata, target_pred);
-        if (enable_oplog_) {
-            auto reservation = ReserveBatchOpLogSlot();
-            if (!reservation) {
-                return tl::make_unexpected(reservation.error());
-            }
-            std::vector<ReplicaID> removed_ids;
-            metadata.VisitReplicas(target_pred,
-                                   [&removed_ids](Replica& replica) {
-                                       removed_ids.push_back(replica.id());
-                                       replica.mark_removed();
-                                   });
-
-            tl::expected<OpLogEntry, ErrorCode> persist_result;
-            if (remaining.empty()) {
-                persist_result = AppendReservedOpLogWithDurableFinalize(
-                    std::move(reservation.value()), OpType::REMOVE,
-                    metadata.tenant_id.value(), key, {},
-                    [this, removed_ids](const OpLogEntry& durable_entry) {
-                        FinalizeRemovedReplicasAfterDurable(
-                            durable_entry, removed_ids, QuotaEraseMode::kFull);
-                    });
-            } else {
-                persist_result = AppendReservedOpLogWithDurableFinalize(
-                    std::move(reservation.value()), OpType::PUT_END,
-                    metadata.tenant_id.value(), key,
-                    SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
-                                                                    remaining),
-                    [this, removed_ids](const OpLogEntry& durable_entry) {
-                        FinalizeRemovedReplicasAfterDurable(
-                            durable_entry, removed_ids, QuotaEraseMode::kFull);
-                    });
-            }
-            if (!persist_result) {
-                const auto error = persist_result.error();
-                for (ReplicaID id : removed_ids) {
-                    if (auto* replica = metadata.GetReplicaByID(id)) {
-                        replica->cancel_remove();
-                    }
-                }
-                return tl::make_unexpected(error);
-            }
-            return true;
+        auto reservation = ReserveBatchOpLogSlot();
+        if (!reservation) {
+            return tl::make_unexpected(reservation.error());
         }
+        std::vector<ReplicaID> removed_ids;
+        metadata.VisitReplicas(target_pred, [&removed_ids](Replica& replica) {
+            removed_ids.push_back(replica.id());
+            replica.mark_removed();
+        });
 
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (remaining.empty()) {
-            persist_result = AppendOpLogWithDurableFinalize(
-                OpType::REMOVE, metadata.tenant_id.value(), key, {}, nullptr);
+            persist_result = AppendReservedOpLogWithDurableFinalize(
+                std::move(reservation.value()), OpType::REMOVE,
+                metadata.tenant_id.value(), key, {},
+                [this, removed_ids](const OpLogEntry& durable_entry) {
+                    FinalizeRemovedReplicasAfterDurable(
+                        durable_entry, removed_ids, QuotaEraseMode::kFull);
+                });
         } else {
-            persist_result = AppendOpLogWithDurableFinalize(
-                OpType::PUT_END, metadata.tenant_id.value(), key,
+            persist_result = AppendReservedOpLogWithDurableFinalize(
+                std::move(reservation.value()), OpType::PUT_END,
+                metadata.tenant_id.value(), key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
                                                                 remaining),
-                nullptr);
+                [this, removed_ids](const OpLogEntry& durable_entry) {
+                    FinalizeRemovedReplicasAfterDurable(
+                        durable_entry, removed_ids, QuotaEraseMode::kFull);
+                });
         }
         if (!persist_result) {
-            return tl::make_unexpected(persist_result.error());
+            const auto error = persist_result.error();
+            for (ReplicaID id : removed_ids) {
+                if (auto* replica = metadata.GetReplicaByID(id)) {
+                    replica->cancel_remove();
+                }
+            }
+            return tl::make_unexpected(error);
         }
+        return true;
     }
 
     if (replica_type == ReplicaType::DISK || replica_type == ReplicaType::DFS) {
