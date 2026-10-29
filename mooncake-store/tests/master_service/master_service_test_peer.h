@@ -138,11 +138,8 @@ class MasterServiceTestPeer {
         return service.dfs_allocator_;
     }
 
-    static auto& DfsKvcsBackend(MasterService& service) {
-        return service.dfs_kvcs_backend_;
-    }
-    static const auto& DfsKvcsBackend(const MasterService& service) {
-        return service.dfs_kvcs_backend_;
+    static bool UsesKvcs(const MasterService& service) {
+        return service.use_kvcs_;
     }
 
     static auto& EnableOplog(MasterService& service) {

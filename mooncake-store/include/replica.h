@@ -229,18 +229,8 @@ struct DistributedFSDescriptor {
     uint64_t object_size = 0;
     uint64_t aligned_size = 0;
     int shard_idx = 0;
-    std::string object_storage_backend;
-
-    bool IsObjectStorage() const { return !object_storage_backend.empty(); }
-    const std::string& ObjectStorageBackend() const {
-        return object_storage_backend;
-    }
-    void SetObjectStorageBackend(std::string backend) {
-        object_storage_backend = std::move(backend);
-    }
-
     YLT_REFL(DistributedFSDescriptor, file_path, offset, object_size,
-             aligned_size, shard_idx, object_storage_backend);
+             aligned_size, shard_idx);
 };
 
 struct DfsReplicaData {

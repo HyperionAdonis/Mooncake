@@ -77,8 +77,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
         EvictionHandler eviction_handler = nullptr) override;
 
     std::vector<tl::expected<void, ErrorCode>> BatchWrite(
-        const std::vector<DfsWriteRequest>& requests,
-        bool replace_existing = false);
+        const std::vector<DfsWriteRequest>& requests);
 
     std::vector<tl::expected<void, ErrorCode>> BatchRead(
         const std::vector<DfsReadRequest>& requests);

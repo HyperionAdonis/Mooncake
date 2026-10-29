@@ -165,18 +165,6 @@ class WrappedMasterService {
         const std::vector<std::string>& keys, bool force = false,
         const std::string& tenant_id = "default");
 
-    std::vector<tl::expected<ReplicaID, ErrorCode>> BatchRemoveStart(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        bool force = false, const std::string& tenant_id = "default");
-    std::vector<tl::expected<void, ErrorCode>> BatchRemoveEnd(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const std::vector<ReplicaID>& replica_ids,
-        const std::string& tenant_id = "default");
-    std::vector<tl::expected<void, ErrorCode>> BatchRemoveRevoke(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const std::vector<ReplicaID>& replica_ids,
-        const std::string& tenant_id = "default");
-
     tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
                                                const UUID& client_id);
 

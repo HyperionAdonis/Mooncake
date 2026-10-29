@@ -417,52 +417,6 @@ FinalizeDecision DetermineFinalizeDecision(
                          : summary.first_error};
 }
 
-bool IsIdempotentDeleteSuccess(const tl::expected<void, ErrorCode>& result) {
-    return result || result.error() == ErrorCode::OBJECT_NOT_FOUND;
-}
-
-// A failed KVCS write may still have stored the value. Delete it before
-// revoking the PROCESSING metadata so an untracked value cannot survive the
-// failure.
-void CleanupKvcsFailedWrite(DistributedStorageBackend& backend,
-                            MasterClient& master_client,
-                            const std::vector<std::string>& keys,
-                            bool is_upsert = false) {
-    auto deleted = backend.BatchDeleteObjects(keys);
-    if (deleted.size() != keys.size()) {
-        LOG(ERROR) << "KVCS write cleanup response size mismatch";
-    }
-
-    std::vector<std::string> revoke_keys;
-    revoke_keys.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (i < deleted.size() && IsIdempotentDeleteSuccess(deleted[i])) {
-            revoke_keys.push_back(keys[i]);
-            continue;
-        }
-        if (i < deleted.size()) {
-            LOG(ERROR)
-                << "Failed to remove KVCS value after write failure, key="
-                << keys[i] << ", error=" << toString(deleted[i].error());
-        }
-    }
-    if (revoke_keys.empty()) return;
-
-    auto revoked =
-        is_upsert ? master_client.BatchUpsertRevoke(revoke_keys)
-                  : master_client.BatchPutRevoke(revoke_keys, ReplicaType::ALL);
-    if (revoked.size() != revoke_keys.size()) {
-        LOG(ERROR) << "KVCS write cleanup revoke response size mismatch";
-    }
-    for (size_t i = 0; i < std::min(revoked.size(), revoke_keys.size()); ++i) {
-        if (!revoked[i])
-            LOG(ERROR) << "Failed to revoke KVCS metadata after write failure, "
-                          "key="
-                       << revoke_keys[i]
-                       << ", error=" << toString(revoked[i].error());
-    }
-}
-
 }  // namespace
 
 [[nodiscard]] size_t CalculateSliceSize(const std::vector<Slice>& slices) {
@@ -612,8 +566,7 @@ Client::~Client() {
     hot_cache_.reset();
 }
 
-ReplicateConfig Client::PrepareReplicateConfig(
-    const ReplicateConfig& config) const {
+ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
     ReplicateConfig client_cfg = config;
     if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs()) {
         // KVCS is represented by one Mooncake DFS descriptor. The adapter
@@ -2039,7 +1992,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
-    ReplicateConfig client_cfg = PrepareReplicateConfig(config);
+    ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -2122,9 +2075,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             dfs_slices.push_back(&slices);
             dfs_descriptors.push_back(replica.get_dfs_descriptor());
         }
-        const auto dfs_results =
-            WriteDfsReplicas(dfs_keys, dfs_slices, dfs_descriptors);
-        for (auto dfs_result : dfs_results) {
+        for (auto dfs_result :
+             WriteDfsReplicas(dfs_keys, dfs_slices, dfs_descriptors)) {
             if (dfs_result == ErrorCode::OK) {
                 transfer_summary.RecordSuccess(ReplicaType::DFS);
             } else {
@@ -2164,16 +2116,6 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     if (finalize_decision.revoke_type.has_value()) {
-        // A failed KVCS write can be ambiguous: the provider may have stored
-        // the value before returning an error. Delete it before removing the
-        // Master reservation so no untracked value can survive the failure.
-        if (!finalize_decision.success && dfs_storage_backend_ &&
-            dfs_storage_backend_->UsesKvcs() &&
-            transfer_summary.failed_dfs_transfers > 0) {
-            CleanupKvcsFailedWrite(*dfs_storage_backend_, master_client_,
-                                   {key});
-            return tl::unexpected(finalize_decision.error);
-        }
         auto revoke_result =
             master_client_.PutRevoke(key, *finalize_decision.revoke_type);
         if (!revoke_result) {
@@ -2267,7 +2209,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
-    ReplicateConfig client_cfg = PrepareReplicateConfig(config);
+    ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -2340,10 +2282,8 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
             dfs_slices.push_back(&slices);
             dfs_descriptors.push_back(replica.get_dfs_descriptor());
         }
-        const auto dfs_results = WriteDfsReplicas(
-            dfs_keys, dfs_slices, dfs_descriptors,
-            dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs());
-        for (auto dfs_result : dfs_results) {
+        for (auto dfs_result :
+             WriteDfsReplicas(dfs_keys, dfs_slices, dfs_descriptors)) {
             if (dfs_result == ErrorCode::OK) {
                 transfer_summary.RecordSuccess(ReplicaType::DFS);
             } else {
@@ -2380,13 +2320,6 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         }
     }
     if (finalize_decision.revoke_type.has_value()) {
-        if (!finalize_decision.success && dfs_storage_backend_ &&
-            dfs_storage_backend_->UsesKvcs() &&
-            transfer_summary.failed_dfs_transfers > 0) {
-            CleanupKvcsFailedWrite(*dfs_storage_backend_, master_client_, {key},
-                                   true);
-            return tl::unexpected(finalize_decision.error);
-        }
         auto revoke_result =
             master_client_.UpsertRevoke(key, *finalize_decision.revoke_type);
         if (!revoke_result) {
@@ -2952,8 +2885,7 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
 std::vector<ErrorCode> Client::WriteDfsReplicas(
     const std::vector<std::string>& keys,
     const std::vector<const std::vector<Slice>*>& slice_lists,
-    const std::vector<DistributedFSDescriptor>& descriptors,
-    bool replace_existing) {
+    const std::vector<DistributedFSDescriptor>& descriptors) {
     if (keys.size() != slice_lists.size() ||
         keys.size() != descriptors.size()) {
         return std::vector<ErrorCode>(keys.size(), ErrorCode::INVALID_PARAMS);
@@ -3054,8 +2986,7 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     }
 
     const auto write_start = std::chrono::steady_clock::now();
-    auto write_results =
-        dfs_storage_backend_->BatchWrite(requests, replace_existing);
+    auto write_results = dfs_storage_backend_->BatchWrite(requests);
     const auto write_latency_us = elapsed_us_since(write_start);
     int64_t success_keys = 0;
     uint64_t success_bytes = 0;
@@ -3102,8 +3033,7 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     return results;
 }
 
-void Client::SubmitDfsWrites(std::vector<PutOperation>& ops,
-                             bool replace_existing) {
+void Client::SubmitDfsWrites(std::vector<PutOperation>& ops) {
     std::vector<std::string> keys;
     std::vector<const std::vector<Slice>*> slice_lists;
     std::vector<DistributedFSDescriptor> descriptors;
@@ -3150,8 +3080,7 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops,
         dfs_metric->RecordSkippedWrites(skipped_writes);
     }
 
-    auto results =
-        WriteDfsReplicas(keys, slice_lists, descriptors, replace_existing);
+    auto results = WriteDfsReplicas(keys, slice_lists, descriptors);
     for (size_t i = 0; i < results.size(); ++i) {
         auto& op = ops[op_indices[i]];
         if (results[i] == ErrorCode::OK) {
@@ -3181,7 +3110,6 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     std::vector<bool> should_succeed(ops.size(), false);
     std::vector<ErrorCode> terminal_errors(ops.size(), ErrorCode::OK);
     std::vector<std::optional<ErrorCode>> finalize_rpc_errors(ops.size());
-    std::vector<std::string> failed_kvcs_puts;
 
     auto add_group_entry = [](BatchFinalizeGroup& group, const std::string& key,
                               size_t index) {
@@ -3249,23 +3177,7 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         should_succeed[i] = finalize_decision.success;
         terminal_errors[i] = finalize_decision.error;
         add_finalize_action(finalize_decision.end_type, true, op.key, i);
-        bool cleanup_failed_kvcs_put = false;
-        if (!finalize_decision.success &&
-            finalize_decision.revoke_type == ReplicaType::ALL &&
-            dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs() &&
-            op.transfer_summary.failed_dfs_transfers > 0) {
-            failed_kvcs_puts.push_back(op.key);
-            cleanup_failed_kvcs_put = true;
-        }
-        if (!cleanup_failed_kvcs_put) {
-            add_finalize_action(finalize_decision.revoke_type, false, op.key,
-                                i);
-        }
-    }
-
-    if (!failed_kvcs_puts.empty()) {
-        CleanupKvcsFailedWrite(*dfs_storage_backend_, master_client_,
-                               failed_kvcs_puts);
+        add_finalize_action(finalize_decision.revoke_type, false, op.key, i);
     }
 
     auto process_end_group = [&](BatchFinalizeGroup& group,
@@ -3389,13 +3301,11 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
     std::vector<size_t> successful_indices;
     std::vector<std::string> failed_keys;
     std::vector<size_t> failed_indices;
-    std::vector<std::string> failed_kvcs_keys;
 
     successful_object_metas.reserve(ops.size());
     successful_indices.reserve(ops.size());
     failed_keys.reserve(ops.size());
     failed_indices.reserve(ops.size());
-    failed_kvcs_keys.reserve(ops.size());
 
     for (size_t i = 0; i < ops.size(); ++i) {
         auto& op = ops[i];
@@ -3419,19 +3329,9 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
                     "Replica transfer failed before upsert finalize"));
         }
         if (!op.IsSuccessful() && !op.replicas.empty()) {
-            if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs() &&
-                op.transfer_summary.failed_dfs_transfers > 0) {
-                failed_kvcs_keys.emplace_back(op.key);
-            } else {
-                failed_keys.emplace_back(op.key);
-                failed_indices.emplace_back(i);
-            }
+            failed_keys.emplace_back(op.key);
+            failed_indices.emplace_back(i);
         }
-    }
-
-    if (!failed_kvcs_keys.empty()) {
-        CleanupKvcsFailedWrite(*dfs_storage_backend_, master_client_,
-                               failed_kvcs_keys, true);
     }
 
     // Process successful operations
@@ -3529,11 +3429,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
 
         // Additional validation and logging for debugging
         if (!op.result.has_value()) {
-            // PutStart reporting an existing Master record is the idempotent
-            // Put case. The same error after replicas were allocated came from
-            // a storage transfer and must remain a failure.
-            if (op.result.error() == ErrorCode::OBJECT_ALREADY_EXISTS &&
-                op.replicas.empty()) {
+            // If error == object already exist, consider as ok (Put semantics).
+            // UpsertStart never returns this error, so this branch is
+            // unreachable for BatchUpsert — kept for BatchPut compatibility.
+            if (op.result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
                 results.back() = {};
                 continue;
             }
@@ -3673,7 +3572,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
             seg_to_ops.at(seg).transfer_summary.first_error;
         op.failure_context = seg_to_ops.at(seg).failure_context;
     }
-    SubmitDfsWrites(ops, is_upsert);
+    SubmitDfsWrites(ops);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
@@ -3699,7 +3598,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
-    ReplicateConfig client_cfg = PrepareReplicateConfig(config);
+    ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -3745,7 +3644,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
-    ReplicateConfig client_cfg = PrepareReplicateConfig(config);
+    ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -3766,8 +3665,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
     WaitForTransfers(ops);
-    SubmitDfsWrites(ops,
-                    dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs());
+    SubmitDfsWrites(ops);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
@@ -3791,7 +3689,7 @@ Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
         return results;
     }
 
-    ReplicateConfig client_cfg = PrepareReplicateConfig(config);
+    ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -3835,6 +3733,9 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
         hot_cache_->BumpKeyGeneration(key);
     }
     auto result = master_client_.Remove(key, force);
+    // if (storage_backend_) {
+    //     storage_backend_->RemoveFile(key);
+    // }
     if (!result) {
         return tl::unexpected(result.error());
     }
@@ -3847,7 +3748,7 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
 tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
                                                     bool force) {
     // KVCS has no provider-side key listing or conditional bulk delete yet.
-    // Removing Master metadata alone would strand the insert-only value.
+    // Removing only Master metadata would skip provider cleanup.
     if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs())
         return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     if (hot_cache_) {
@@ -3855,6 +3756,9 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
     }
 
     auto result = master_client_.RemoveByRegex(str, force);
+    // if (storage_backend_) {
+    //     storage_backend_->RemoveByRegex(str);
+    // }
     if (!result) {
         return tl::unexpected(result.error());
     }
@@ -3890,114 +3794,38 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
         hot_cache_->BumpKeyGenerations(keys);
     }
 
-    const bool kvcs = dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs();
-    if (kvcs) {
-        std::vector<tl::expected<void, ErrorCode>> results(
-            keys.size(), tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
-        auto starts = master_client_.BatchRemoveStart(keys, force);
-        if (starts.size() != keys.size()) {
-            std::vector<std::string> revoke_keys;
-            std::vector<ReplicaID> revoke_ids;
-            for (size_t i = 0; i < std::min(keys.size(), starts.size()); ++i) {
-                if (starts[i]) {
-                    revoke_keys.push_back(keys[i]);
-                    revoke_ids.push_back(*starts[i]);
-                }
-            }
-            if (!revoke_keys.empty())
-                (void)master_client_.BatchRemoveRevoke(revoke_keys, revoke_ids);
-            return results;
-        }
-
-        std::vector<std::string> prepared_keys;
-        std::vector<ReplicaID> prepared_ids;
-        std::vector<size_t> prepared_indices;
-        for (size_t i = 0; i < starts.size(); ++i) {
-            if (!starts[i]) {
-                results[i] = tl::make_unexpected(starts[i].error());
-                continue;
-            }
-            prepared_keys.push_back(keys[i]);
-            prepared_ids.push_back(*starts[i]);
-            prepared_indices.push_back(i);
-        }
-        if (prepared_keys.empty()) return results;
-
-        const auto delete_results =
-            dfs_storage_backend_->BatchDeleteObjects(prepared_keys);
-        if (delete_results.size() != prepared_keys.size()) {
-            (void)master_client_.BatchRemoveRevoke(prepared_keys, prepared_ids);
-            return results;
-        }
-
-        std::vector<std::string> end_keys;
-        std::vector<ReplicaID> end_ids;
-        std::vector<size_t> end_indices;
-        std::vector<std::string> revoke_keys;
-        std::vector<ReplicaID> revoke_ids;
-        for (size_t i = 0; i < prepared_keys.size(); ++i) {
-            const size_t result_index = prepared_indices[i];
-            if (!IsIdempotentDeleteSuccess(delete_results[i])) {
-                results[result_index] =
-                    tl::make_unexpected(delete_results[i].error());
-                revoke_keys.push_back(prepared_keys[i]);
-                revoke_ids.push_back(prepared_ids[i]);
-            } else {
-                end_keys.push_back(prepared_keys[i]);
-                end_ids.push_back(prepared_ids[i]);
-                end_indices.push_back(result_index);
-            }
-        }
-
-        if (!revoke_keys.empty()) {
-            auto revoked =
-                master_client_.BatchRemoveRevoke(revoke_keys, revoke_ids);
-            if (revoked.size() != revoke_keys.size()) {
-                LOG(ERROR) << "KVCS remove revoke response size mismatch";
-            } else {
-                for (size_t i = 0; i < revoked.size(); ++i) {
-                    if (!revoked[i]) {
-                        LOG(ERROR) << "Failed to revoke KVCS remove for key="
-                                   << revoke_keys[i] << ": "
-                                   << toString(revoked[i].error());
-                    }
-                }
-            }
-        }
-
-        if (!end_keys.empty()) {
-            auto ended = master_client_.BatchRemoveEnd(end_keys, end_ids);
-            if (ended.size() != end_keys.size()) return results;
-            std::vector<std::string> removed_keys;
-            for (size_t i = 0; i < ended.size(); ++i) {
-                if (ended[i] ||
-                    ended[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
-                    results[end_indices[i]] = {};
-                    removed_keys.push_back(end_keys[i]);
-                } else {
-                    results[end_indices[i]] = ended[i];
-                }
-            }
-            if (hot_cache_ && !removed_keys.empty())
-                hot_cache_->RemoveHotKeys(removed_keys);
-        }
-        return results;
-    }
-
     auto results = master_client_.BatchRemove(keys, force);
 
-    if (hot_cache_) {
-        std::vector<std::string> removed_keys;
-        removed_keys.reserve(std::min(keys.size(), results.size()));
-        for (size_t i = 0; i < keys.size(); ++i) {
-            if (i < results.size() && results[i].has_value()) {
-                removed_keys.emplace_back(keys[i]);
-            }
-        }
-        if (!removed_keys.empty()) {
-            hot_cache_->RemoveHotKeys(removed_keys);
+    const size_t result_count = std::min(keys.size(), results.size());
+    std::vector<std::string> removed_keys;
+    std::vector<size_t> removed_indices;
+    removed_keys.reserve(result_count);
+    removed_indices.reserve(result_count);
+    for (size_t i = 0; i < result_count; ++i) {
+        if (results[i]) {
+            removed_keys.emplace_back(keys[i]);
+            removed_indices.push_back(i);
         }
     }
+
+    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs() &&
+        !removed_keys.empty()) {
+        const auto deleted =
+            dfs_storage_backend_->BatchDeleteObjects(removed_keys);
+        if (deleted.size() != removed_keys.size()) {
+            for (size_t index : removed_indices) {
+                results[index] =
+                    tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        } else {
+            for (size_t i = 0; i < deleted.size(); ++i) {
+                if (!deleted[i]) results[removed_indices[i]] = deleted[i];
+            }
+        }
+    }
+
+    if (hot_cache_ && !removed_keys.empty())
+        hot_cache_->RemoveHotKeys(removed_keys);
 
     return results;
 }
@@ -5249,8 +5077,8 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
         return ErrorCode::DFS_SERVICE_UNAVAILABLE;
     }
 
-    const auto& desc = replica_descriptor.get_dfs_descriptor();
     auto* dfs_metric = GetDfsMetricPtr();
+    const auto& desc = replica_descriptor.get_dfs_descriptor();
     std::vector<DfsReadRequest> requests{DfsReadRequest{key, desc, slices}};
     const auto read_start = std::chrono::steady_clock::now();
     auto results = dfs_storage_backend_->BatchRead(requests);

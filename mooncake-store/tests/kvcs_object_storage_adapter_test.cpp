@@ -262,15 +262,18 @@ TEST(KvcsObjectStorageAdapterTest, GetRejectsMasterSizeMismatch) {
     EXPECT_EQ(result[0].error(), ErrorCode::FILE_READ_FAIL);
 }
 
-TEST(KvcsObjectStorageAdapterTest, BatchPutKeepsPerKeyErrorsIsolated) {
+TEST(KvcsObjectStorageAdapterTest, PutOverwritesAndKeepsErrorsIsolated) {
     auto adapter = MakeAdapter();
     ASSERT_TRUE(adapter.Init());
     std::string first = "one";
     iovec first_iov{first.data(), first.size()};
     ASSERT_TRUE(adapter.PutBatch({{"key", &first_iov, 1}})[0]);
-    auto duplicate = adapter.PutBatch({{"key", &first_iov, 1}});
-    ASSERT_FALSE(duplicate[0]);
-    EXPECT_EQ(duplicate[0].error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+    std::string replacement = "new";
+    iovec replacement_iov{replacement.data(), replacement.size()};
+    ASSERT_TRUE(adapter.PutBatch({{"key", &replacement_iov, 1}})[0]);
+    std::string output(replacement.size(), '\0');
+    ASSERT_TRUE(adapter.GetBatch({{"key", output.data(), output.size()}})[0]);
+    EXPECT_EQ(output, replacement);
 
     std::string second = "two";
     iovec invalid_iov{nullptr, second.size()};

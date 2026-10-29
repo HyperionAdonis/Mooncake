@@ -149,8 +149,29 @@ std::vector<tl::expected<void, ErrorCode>> KvcsObjectStorageAdapter::PutBatch(
         put_indices.push_back(i);
     }
 
+    std::vector<ObjectKey> encoded_keys;
+    encoded_keys.reserve(puts.size());
+    for (const auto& put : puts) encoded_keys.push_back(put.logical_key);
+    auto deleted = driver_->BatchDelete(encoded_keys);
+    if (deleted.size() != puts.size())
+        return Errors<void>(requests.size(), ErrorCode::INTERNAL_ERROR);
+
+    std::vector<KvcsIoRequest> pending;
+    std::vector<size_t> pending_indices;
+    pending.reserve(puts.size());
+    pending_indices.reserve(put_indices.size());
+    for (size_t i = 0; i < deleted.size(); ++i) {
+        if (!deleted[i]) {
+            results[put_indices[i]] =
+                tl::make_unexpected(deleted[i].error());
+            continue;
+        }
+        pending.push_back(std::move(puts[i]));
+        pending_indices.push_back(put_indices[i]);
+    }
+
     RunKvcsBatch<void>(
-        put_indices, results, [&] { return driver_->BatchPut(puts); },
+        pending_indices, results, [&] { return driver_->BatchPut(pending); },
         [](auto result, size_t) { return result; });
     return results;
 }

@@ -10,6 +10,11 @@ Size that region for the configured maximum value, batch size and SDK worker
 counts according to the KVCacheStore deployment guide.
 The presence of a socket never enables the adapter automatically.
 
+KVCS does not add a second client I/O path. DFS `BatchWrite`/`BatchRead`
+dispatch through the existing `ObjectStorageAdapter` contract used by OSS.
+Only the control plane differs: KVCS uses Master-owned DFS metadata, while OSS
+keeps its existing offload flow.
+
 ## Initial scope
 
 This first change supports **one KVCacheStore target and one value per object**.
@@ -31,17 +36,18 @@ processes. The initial distributed-storage configuration is single-tenant;
 each logical key is mapped to a printable, injective provider key.
 KVCS Low Level Put is insert-only, so Upsert reuses Mooncake's existing
 Master-owned Upsert state machine and performs a provider Delete followed by
-Put while the DFS replica is PROCESSING. A failed replacement is revoked after
-one best-effort provider cleanup confirms the value is absent; it does not
-restore the previous KVCS value.
-Single-key `Remove` and `BatchRemove` use a Master-owned reservation: Master
-first checks the lease and replica state and hides the exact replica generation,
-the client then deletes the KVCS value, and Master either commits the metadata
-removal or restores the reserved replicas on provider failure. A missing
-provider value is idempotent. The reservation blocks a same-key Put while
-physical deletion is in flight. `RemoveByRegex` and `RemoveAll` return
-`NOT_SUPPORTED` in this initial KVCS mode because provider-wide conditional
-deletion is not defined.
+Put at the adapter boundary. This keeps KVCS replacement logic out of the
+generic Put/Upsert control path. Replacement is not atomic: if the Put fails
+after Delete, Mooncake revokes the processing replica but cannot restore the
+old KVCS value.
+
+Single-key `Remove` and `BatchRemove` reuse the existing Master metadata
+removal first, then delete values for the successfully removed keys from KVCS.
+A provider deletion failure is returned to the caller but does not restore
+Master metadata; it can leave an unreachable provider value. The next write
+pre-deletes the same physical key, and KVCS GC may reclaim it independently.
+`RemoveByRegex` and `RemoveAll` return `NOT_SUPPORTED` in this initial KVCS
+mode because provider-wide conditional deletion is not defined.
 
 The KVCS SDK is optional at build time. With no SDK, other Mooncake backends
 build normally and explicit KVCS initialization returns `NOT_SUPPORTED`.
@@ -68,10 +74,9 @@ value. If Get explicitly returns `OBJECT_NOT_FOUND`, Mooncake conditionally
 removes only the DFS replica observed by that read, matching its `ReplicaID`
 under the Master metadata lock. A timeout, transport failure, or other KVCS
 error keeps metadata unchanged. Master finalization follows the existing client
-path without KVCS-specific retries. If a KVCS Put reports failure after it may
-have stored the value, Mooncake makes one best-effort delete and reuses the
-existing `PutRevoke` path only after the value is confirmed absent; it does not
-maintain a client-local uncertain-key index.
+path without KVCS-specific retries or cleanup branches. If a KVCS Put result is
+uncertain, Mooncake revokes the processing metadata through the existing path;
+the next write's pre-delete makes any leftover provider value harmless.
 
 ## Temporary capacity source
 
@@ -80,9 +85,9 @@ temporary workaround, Mooncake Master reads the EFC Prometheus endpoint and
 maps the result directly to the existing DFS usage snapshot
 (`used_bytes`/`capacity_bytes`). DFS metrics, watermark configuration, and the
 eviction thread remain the only capacity-control path; the object-storage
-adapter does not define a second capacity interface. The Prometheus names and
-labels are isolated in `KvcsEfcMetricsCapacityProvider`. Replace only this
-source when KVCS publishes a stable Low Level capacity API.
+adapter does not define a second capacity model. Prometheus details are
+isolated in `KvcsEfcMetricsCapacityProvider`, which can be replaced when KVCS
+publishes a stable Low Level capacity API.
 
 The provider selects exactly one G3.5 mountpoint using these samples:
 
@@ -99,8 +104,6 @@ endpoint is `http://127.0.0.1:9093/metrics`; set
 The `mountpoint_id` label is taken from the existing single-target EFC
 configuration; Mooncake does not maintain a second target configuration.
 
-This change only feeds the existing DFS capacity snapshot. The follow-up
-watermark path must reuse the existing DFS configuration and eviction thread.
-Deleting a selected KVCS replica still requires deleting the KVCS value first
-and then conditionally removing the same DFS replica metadata; it must not
-introduce a client-local metadata index or a second decision loop.
+This change feeds the existing DFS capacity snapshot. Follow-up eviction work
+must continue to reuse the existing DFS configuration and eviction thread; it
+must not add a client-local metadata index or a second decision loop.

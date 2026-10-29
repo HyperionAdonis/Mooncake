@@ -136,14 +136,6 @@ tl::expected<void, ErrorCode> TransferAll(FileSystemAdapter& adapter, int fd,
     }
 }
 
-bool IsObjectDescriptorValid(const DistributedFSDescriptor& desc,
-                             const DistributedStorageConfig& config,
-                             const ObjectStorageAdapter& adapter) {
-    return desc.IsObjectStorage() && desc.object_size != 0 &&
-           desc.ObjectStorageBackend() == adapter.GetName() &&
-           desc.ObjectStorageBackend() == config.fs_adapter_type;
-}
-
 tl::expected<uint64_t, ErrorCode> CalculateSliceBytes(
     std::span<const Slice> slices) {
     uint64_t total = 0;
@@ -638,7 +630,7 @@ void DistributedStorageBackend::SubmitBatchIo(
 
 std::vector<tl::expected<void, ErrorCode>>
 DistributedStorageBackend::BatchWrite(
-    const std::vector<DfsWriteRequest>& requests, bool replace_existing) {
+    const std::vector<DfsWriteRequest>& requests) {
     std::vector<tl::expected<void, ErrorCode>> results(requests.size());
 
     if (!initialized_) {
@@ -658,16 +650,11 @@ DistributedStorageBackend::BatchWrite(
         for (size_t index = 0; index < requests.size(); ++index) {
             const auto& request = requests[index];
             const auto& desc = request.descriptor;
-            if (!desc.IsObjectStorage()) {
-                results[index] = tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
-                continue;
-            }
             auto total_size = CalculateSliceBytes(request.slices);
             if (request.slices.empty() || !total_size ||
                 request.slices.size() >
                     static_cast<size_t>(std::numeric_limits<int>::max()) ||
-                !IsObjectDescriptorValid(desc, distributed_config_,
-                                         *object_storage_adapter_) ||
+                desc.object_size == 0 ||
                 *total_size != desc.object_size) {
                 results[index] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
@@ -679,40 +666,6 @@ DistributedStorageBackend::BatchWrite(
             object_requests.push_back(
                 {request.key, iovs.data(), static_cast<int>(iovs.size())});
             request_indices.push_back(index);
-        }
-
-        if (replace_existing && UsesKvcs() && !object_requests.empty()) {
-            std::vector<std::string> keys;
-            keys.reserve(object_requests.size());
-            for (const auto& request : object_requests) {
-                keys.push_back(request.logical_key);
-            }
-            const auto delete_results =
-                object_storage_adapter_->DeleteBatch(keys);
-            if (delete_results.size() != object_requests.size()) {
-                for (size_t index : request_indices) {
-                    results[index] =
-                        tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-                }
-                return results;
-            }
-
-            std::vector<ObjectPutRequest> pending_requests;
-            std::vector<size_t> pending_indices;
-            pending_requests.reserve(object_requests.size());
-            pending_indices.reserve(request_indices.size());
-            for (size_t i = 0; i < delete_results.size(); ++i) {
-                if (!delete_results[i] &&
-                    delete_results[i].error() != ErrorCode::OBJECT_NOT_FOUND) {
-                    results[request_indices[i]] =
-                        tl::make_unexpected(delete_results[i].error());
-                    continue;
-                }
-                pending_requests.push_back(object_requests[i]);
-                pending_indices.push_back(request_indices[i]);
-            }
-            object_requests = std::move(pending_requests);
-            request_indices = std::move(pending_indices);
         }
 
         auto object_results =
@@ -824,15 +777,10 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         for (size_t index = 0; index < requests.size(); ++index) {
             const auto& request = requests[index];
             const auto& desc = request.descriptor;
-            if (!desc.IsObjectStorage()) {
-                results[index] = tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
-                continue;
-            }
             auto capacity = CalculateSliceBytes(request.slices);
             if (request.slices.empty() || !capacity ||
                 desc.object_size > std::numeric_limits<size_t>::max() ||
-                !IsObjectDescriptorValid(desc, distributed_config_,
-                                         *object_storage_adapter_) ||
+                desc.object_size == 0 ||
                 *capacity < desc.object_size) {
                 results[index] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 continue;

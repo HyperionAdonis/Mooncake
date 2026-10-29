@@ -358,15 +358,6 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchRemove(
         const std::vector<std::string>& keys, bool force = false);
 
-    [[nodiscard]] std::vector<tl::expected<ReplicaID, ErrorCode>>
-    BatchRemoveStart(const std::vector<std::string>& keys, bool force = false);
-    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchRemoveEnd(
-        const std::vector<std::string>& keys,
-        const std::vector<ReplicaID>& replica_ids);
-    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchRemoveRevoke(
-        const std::vector<std::string>& keys,
-        const std::vector<ReplicaID>& replica_ids);
-
     /**
      * @brief Registers a segment to master for allocation
      * @param segment Segment to register

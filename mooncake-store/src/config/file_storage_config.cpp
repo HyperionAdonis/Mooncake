@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "bool_parser.h"
+#include "config/distributed_storage_config.h"
 #include "environ.h"
 #include "environment_variables.h"
 
@@ -205,8 +206,10 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 }
 
 bool FileStorageConfig::Validate() const {
-    if (storage_backend_type != StorageBackendType::kDistributed &&
-        !ValidatePath(storage_filepath)) {
+    const bool uses_kvcs =
+        storage_backend_type == StorageBackendType::kDistributed &&
+        DistributedStorageConfig::FromEnvironment().UsesKvcs();
+    if (!uses_kvcs && !ValidatePath(storage_filepath)) {
         return false;
     }
     if (total_keys_limit <= 0) {

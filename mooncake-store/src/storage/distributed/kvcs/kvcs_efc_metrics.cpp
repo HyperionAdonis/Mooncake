@@ -6,7 +6,6 @@
 #include <limits>
 #include <optional>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 
 #include "ascii_string.h"
@@ -15,95 +14,27 @@
 namespace mooncake {
 namespace {
 
-struct PrometheusSample {
+struct CapacitySample {
     std::string_view name;
-    std::unordered_map<std::string, std::string> labels;
+    std::string_view labels;
     std::string_view value;
 };
 
-tl::expected<PrometheusSample, std::string> ParseSample(std::string_view line) {
-    line = TrimAsciiWhitespace(line);
-    if (line.empty() || line.front() == '#')
-        return tl::make_unexpected("ignored");
-
-    const size_t name_end = line.find_first_of("{ \t");
-    if (name_end == std::string_view::npos)
-        return tl::make_unexpected("missing metric value");
-    PrometheusSample sample{
-        .name = line.substr(0, name_end), .labels = {}, .value = {}};
-    size_t pos = name_end;
-    if (line[pos] == '{') {
-        ++pos;
-        while (true) {
-            while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t'))
-                ++pos;
-            if (pos == line.size())
-                return tl::make_unexpected("unterminated labels");
-            if (line[pos] == '}') {
-                ++pos;
-                break;
-            }
-
-            const size_t label_start = pos;
-            while (pos < line.size() && line[pos] != '=' && line[pos] != ' ' &&
-                   line[pos] != '\t')
-                ++pos;
-            const std::string label(
-                line.substr(label_start, pos - label_start));
-            while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t'))
-                ++pos;
-            if (label.empty() || pos + 1 >= line.size() || line[pos] != '=' ||
-                line[pos + 1] != '"')
-                return tl::make_unexpected("invalid label");
-            pos += 2;
-
-            std::string value;
-            bool closed = false;
-            while (pos < line.size()) {
-                const char ch = line[pos++];
-                if (ch == '"') {
-                    closed = true;
-                    break;
-                }
-                if (ch == '\\') {
-                    if (pos == line.size())
-                        return tl::make_unexpected("invalid label escape");
-                    const char escaped = line[pos++];
-                    if (escaped == 'n')
-                        value.push_back('\n');
-                    else if (escaped == '\\' || escaped == '"')
-                        value.push_back(escaped);
-                    else
-                        return tl::make_unexpected("invalid label escape");
-                } else {
-                    value.push_back(ch);
-                }
-            }
-            if (!closed ||
-                !sample.labels.emplace(label, std::move(value)).second)
-                return tl::make_unexpected("invalid or duplicate label");
-
-            while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t'))
-                ++pos;
-            if (pos == line.size())
-                return tl::make_unexpected("unterminated labels");
-            if (line[pos] == ',') {
-                ++pos;
-                continue;
-            }
-            if (line[pos] == '}') {
-                ++pos;
-                break;
-            }
-            return tl::make_unexpected("invalid label separator");
-        }
-    }
-
+tl::expected<CapacitySample, std::string> ParseCapacitySample(
+    std::string_view line, size_t name_end) {
+    if (line[name_end] != '{')
+        return tl::make_unexpected("capacity metric has no labels");
+    const size_t labels_end = line.find('}', name_end + 1);
+    if (labels_end == std::string_view::npos)
+        return tl::make_unexpected("unterminated capacity labels");
+    size_t pos = labels_end + 1;
     while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
     if (pos == line.size()) return tl::make_unexpected("missing metric value");
     const size_t value_end = line.find_first_of(" \t", pos);
-    sample.value = line.substr(pos, value_end - pos);
-    return sample;
+    return CapacitySample{.name = line.substr(0, name_end),
+                          .labels = line.substr(name_end + 1,
+                                                labels_end - name_end - 1),
+                          .value = line.substr(pos, value_end - pos)};
 }
 
 tl::expected<long double, std::string> ParseNumber(std::string_view value) {
@@ -115,10 +46,22 @@ tl::expected<long double, std::string> ParseNumber(std::string_view value) {
     return parsed;
 }
 
-bool HasLabel(const PrometheusSample& sample, std::string_view name,
+bool HasLabel(std::string_view labels, std::string_view name,
               std::string_view value) {
-    const auto it = sample.labels.find(std::string(name));
-    return it != sample.labels.end() && it->second == value;
+    const std::string needle = std::string(name) + "=\"";
+    size_t pos = 0;
+    while ((pos = labels.find(needle, pos)) != std::string_view::npos) {
+        if (pos != 0 && labels[pos - 1] != ',' && labels[pos - 1] != ' ' &&
+            labels[pos - 1] != '\t') {
+            pos += needle.size();
+            continue;
+        }
+        const size_t start = pos + needle.size();
+        const size_t end = labels.find('"', start);
+        return end != std::string_view::npos &&
+               labels.substr(start, end - start) == value;
+    }
+    return false;
 }
 
 tl::expected<uint64_t, std::string> ToBytes(std::string_view token) {
@@ -150,21 +93,26 @@ tl::expected<DfsUsageSnapshot, std::string> ParseKvcsEfcCapacityMetrics(
                                                     : end - start);
         start = end == std::string_view::npos ? metrics.size() + 1 : end + 1;
 
-        auto parsed = ParseSample(line);
-        if (!parsed) {
-            if (parsed.error() == "ignored") continue;
-            return tl::make_unexpected(parsed.error());
-        }
+        const auto trimmed = TrimAsciiWhitespace(line);
+        if (trimmed.empty() || trimmed.front() == '#') continue;
+        const size_t name_end = trimmed.find_first_of("{ \t");
+        if (name_end == std::string_view::npos) continue;
+        const auto name = trimmed.substr(0, name_end);
+        if (name != "kvcs_efc_storage_capacity_bytes" &&
+            name != "kvcs_efc_storage_ready")
+            continue;
+        auto parsed = ParseCapacitySample(trimmed, name_end);
+        if (!parsed) return tl::make_unexpected(parsed.error());
         const auto& sample = *parsed;
-        if (!HasLabel(sample, "tier", "g35") ||
-            !HasLabel(sample, "mountpoint_id", mountpoint_id))
+        if (!HasLabel(sample.labels, "tier", "g35") ||
+            !HasLabel(sample.labels, "mountpoint_id", mountpoint_id))
             continue;
 
         if (sample.name == "kvcs_efc_storage_capacity_bytes") {
             std::optional<uint64_t>* destination = nullptr;
-            if (HasLabel(sample, "state", "total"))
+            if (HasLabel(sample.labels, "state", "total"))
                 destination = &total;
-            else if (HasLabel(sample, "state", "used"))
+            else if (HasLabel(sample.labels, "state", "used"))
                 destination = &used;
             else
                 continue;

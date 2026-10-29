@@ -76,7 +76,7 @@ TEST_F(MasterServiceTest,
     MasterService service(config);
     EXPECT_TRUE(MasterServiceTestPeer::EnableDfs(service));
     EXPECT_EQ(MasterServiceTestPeer::DfsAllocator(service), nullptr);
-    EXPECT_EQ(MasterServiceTestPeer::DfsKvcsBackend(service), "kvcs-lowlevel");
+    EXPECT_TRUE(MasterServiceTestPeer::UsesKvcs(service));
 }
 
 TEST_F(MasterServiceTest,
@@ -121,7 +121,6 @@ TEST_F(MasterServiceTest, KvcsStandbyRestoreAcceptsObjectStorageDfsReplica) {
     dfs_descriptor.object_size = kObjectSize;
     dfs_descriptor.aligned_size = kObjectSize;
     dfs_descriptor.shard_idx = -1;
-    dfs_descriptor.SetObjectStorageBackend("kvcs-lowlevel");
     Replica replica(std::move(dfs_descriptor), ReplicaStatus::COMPLETE);
 
     StandbyObjectMetadata metadata;
@@ -141,8 +140,6 @@ TEST_F(MasterServiceTest, KvcsStandbyRestoreAcceptsObjectStorageDfsReplica) {
     ASSERT_EQ(response->replicas.size(), 1u);
     ASSERT_TRUE(response->replicas[0].is_dfs_replica());
     const auto& restored = response->replicas[0].get_dfs_descriptor();
-    EXPECT_TRUE(restored.IsObjectStorage());
-    EXPECT_EQ(restored.ObjectStorageBackend(), "kvcs-lowlevel");
     EXPECT_EQ(restored.object_size, kObjectSize);
 }
 
@@ -158,7 +155,6 @@ TEST_F(MasterServiceTest, KvcsMissEvictsOnlyTheObservedDfsReplica) {
     descriptor.object_size = 128;
     descriptor.aligned_size = 128;
     descriptor.shard_idx = -1;
-    descriptor.SetObjectStorageBackend("kvcs-lowlevel");
     Replica first(descriptor, ReplicaStatus::COMPLETE);
     Replica second(descriptor, ReplicaStatus::COMPLETE);
     const ReplicaID first_id = first.id();
@@ -204,62 +200,6 @@ TEST_F(MasterServiceTest, KvcsMissEvictsOnlyTheObservedDfsReplica) {
     auto missing = service.GetReplicaList(key, TenantId::Default());
     ASSERT_FALSE(missing.has_value());
     EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
-}
-
-TEST_F(MasterServiceTest, KvcsRemoveReservesThenCommitsOrRestoresMetadata) {
-    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
-    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
-    ScopedEnvVar kvcs_adapter("MOONCAKE_DFS_FS_ADAPTER", "kvcs-lowlevel");
-
-    MasterService service;
-    const UUID owner = generate_uuid();
-    const UUID remover = generate_uuid();
-    const std::string key = "kvcs-remove-lifecycle";
-    DistributedFSDescriptor descriptor;
-    descriptor.object_size = 128;
-    descriptor.aligned_size = 128;
-    descriptor.shard_idx = -1;
-    descriptor.SetObjectStorageBackend("kvcs-lowlevel");
-    Replica replica(descriptor, ReplicaStatus::COMPLETE);
-
-    StandbyObjectMetadata metadata;
-    metadata.client_id = owner;
-    metadata.size = descriptor.object_size;
-    metadata.replicas = {replica.get_descriptor()};
-    ASSERT_TRUE(service
-                    .RestoreFromStandbySnapshot(
-                        {{std::string(TenantId::kDefaultValue), key, metadata}},
-                        /*initial_oplog_sequence_id=*/0, {})
-                    .has_value());
-
-    auto started = service.BatchRemoveStart(remover, {key}, TenantId::Default(),
-                                            /*force=*/true);
-    ASSERT_EQ(started.size(), 1u);
-    ASSERT_TRUE(started[0].has_value());
-    const ReplicaID reserved_replica_id = *started[0];
-    auto hidden = service.GetReplicaList(key, TenantId::Default());
-    ASSERT_FALSE(hidden.has_value());
-
-    auto revoked = service.BatchRemoveRevoke(
-        remover, {key}, {reserved_replica_id}, TenantId::Default());
-    ASSERT_EQ(revoked.size(), 1u);
-    ASSERT_TRUE(revoked[0].has_value());
-    auto restored = service.GetReplicaList(key, TenantId::Default());
-    ASSERT_TRUE(restored.has_value());
-    ASSERT_EQ(restored->replicas.size(), 1u);
-    EXPECT_EQ(restored->replicas[0].id, reserved_replica_id);
-
-    started = service.BatchRemoveStart(remover, {key}, TenantId::Default(),
-                                       /*force=*/true);
-    ASSERT_EQ(started.size(), 1u);
-    ASSERT_TRUE(started[0].has_value());
-    auto ended = service.BatchRemoveEnd(remover, {key}, {*started[0]},
-                                        TenantId::Default());
-    ASSERT_EQ(ended.size(), 1u);
-    ASSERT_TRUE(ended[0].has_value());
-    auto removed = service.GetReplicaList(key, TenantId::Default());
-    ASSERT_FALSE(removed.has_value());
-    EXPECT_EQ(removed.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
 
 TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {

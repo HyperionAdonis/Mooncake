@@ -77,6 +77,8 @@ void ExpectDefaultConfig(const DistributedStorageConfig& config) {
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.7);
     EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(30));
     EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(5));
+    EXPECT_TRUE(config.object_storage_config_path.empty());
+    EXPECT_FALSE(config.UsesKvcs());
 }
 
 DistributedStorageConfig ValidConfig() {

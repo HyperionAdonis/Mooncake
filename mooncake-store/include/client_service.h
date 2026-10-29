@@ -986,8 +986,7 @@ class Client {
                                             const WriteBufferStager& stager);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
-    void SubmitDfsWrites(std::vector<PutOperation>& ops,
-                         bool replace_existing = false);
+    void SubmitDfsWrites(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
@@ -998,8 +997,7 @@ class Client {
     std::vector<ErrorCode> WriteDfsReplicas(
         const std::vector<std::string>& keys,
         const std::vector<const std::vector<Slice>*>& slice_lists,
-        const std::vector<DistributedFSDescriptor>& descriptors,
-        bool replace_existing = false);
+        const std::vector<DistributedFSDescriptor>& descriptors);
 
     std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
         std::vector<PutOperation>& ops, bool is_upsert);
@@ -1007,7 +1005,7 @@ class Client {
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices);
-    ReplicateConfig PrepareReplicateConfig(const ReplicateConfig& config) const;
+    ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
 
     // Client identification
     const UUID client_id_;

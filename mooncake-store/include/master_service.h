@@ -658,16 +658,6 @@ class MasterService {
     auto Remove(const std::string& key, const TenantId& tenant_id,
                 bool force = false) -> tl::expected<void, ErrorCode>;
 
-    std::vector<tl::expected<ReplicaID, ErrorCode>> BatchRemoveStart(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const TenantId& tenant_id, bool force = false);
-    std::vector<tl::expected<void, ErrorCode>> BatchRemoveEnd(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const std::vector<ReplicaID>& replica_ids, const TenantId& tenant_id);
-    std::vector<tl::expected<void, ErrorCode>> BatchRemoveRevoke(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const std::vector<ReplicaID>& replica_ids, const TenantId& tenant_id);
-
     /**
      * @brief Removes objects from the master whose keys match a regex pattern.
      * @param str The regular expression string to match against object keys.
@@ -2203,7 +2193,7 @@ class MasterService {
 
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
-    std::optional<std::string> dfs_kvcs_backend_;
+    bool use_kvcs_{false};
     std::unique_ptr<KvcsEfcMetricsCapacityProvider> dfs_kvcs_capacity_provider_;
     std::chrono::seconds dfs_kvcs_capacity_check_interval_{5};
     mutable std::mutex dfs_kvcs_usage_mutex_;

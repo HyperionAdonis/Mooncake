@@ -153,21 +153,6 @@ struct RpcNameTraits<&WrappedMasterService::BatchRemove> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::BatchRemoveStart> {
-    static constexpr const char* value = "BatchRemoveStart";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::BatchRemoveEnd> {
-    static constexpr const char* value = "BatchRemoveEnd";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::BatchRemoveRevoke> {
-    static constexpr const char* value = "BatchRemoveRevoke";
-};
-
-template <>
 struct RpcNameTraits<&WrappedMasterService::MountSegment> {
     static constexpr const char* value = "MountSegment";
 };
@@ -898,26 +883,6 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchRemove(
         keys.size(), keys, force, tenant_id_.value());
     timer.LogResponse("result=", result.size(), " operations");
     return result;
-}
-
-std::vector<tl::expected<ReplicaID, ErrorCode>> MasterClient::BatchRemoveStart(
-    const std::vector<std::string>& keys, bool force) {
-    return invoke_batch_rpc<&WrappedMasterService::BatchRemoveStart, ReplicaID>(
-        keys.size(), client_id_, keys, force, tenant_id_.value());
-}
-
-std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchRemoveEnd(
-    const std::vector<std::string>& keys,
-    const std::vector<ReplicaID>& replica_ids) {
-    return invoke_batch_rpc<&WrappedMasterService::BatchRemoveEnd, void>(
-        keys.size(), client_id_, keys, replica_ids, tenant_id_.value());
-}
-
-std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchRemoveRevoke(
-    const std::vector<std::string>& keys,
-    const std::vector<ReplicaID>& replica_ids) {
-    return invoke_batch_rpc<&WrappedMasterService::BatchRemoveRevoke, void>(
-        keys.size(), client_id_, keys, replica_ids, tenant_id_.value());
 }
 
 tl::expected<void, ErrorCode> MasterClient::MountSegment(
