@@ -39,7 +39,6 @@ class KvcsObjectStorageAdapter final : public ObjectStorageAdapter {
     tl::expected<std::vector<KeyInfo>, ErrorCode> ListKeys() override;
 
     tl::expected<void, ErrorCode> Init() override;
-    tl::expected<void, ErrorCode> CheckHealth() override;
     const char* GetName() const override { return kKvcsLowLevelAdapterName; }
 
    private:

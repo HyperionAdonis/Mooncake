@@ -61,8 +61,6 @@ class KvcsDriver {
     virtual uint32_t MaxKeySize() const { return kKvcsDefaultMaxKeySize; }
 
     virtual KvcsIoResults BatchPut(std::span<const KvcsIoRequest> requests) = 0;
-    virtual KvcsIoResults BatchQuery(
-        std::span<const ObjectKey> logical_keys) = 0;
     virtual KvcsIoResults BatchGet(std::span<const KvcsIoRequest> requests) = 0;
     virtual KvcsIoResults BatchDelete(
         std::span<const ObjectKey> logical_keys) = 0;

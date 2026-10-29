@@ -162,16 +162,6 @@ void SetBatchError(KvcsIoResults& results, const std::vector<size_t>& indices,
         results[indices[begin + i]] = tl::make_unexpected(error);
 }
 
-tl::expected<void, ErrorCode> QueryStatus(std::string_view status) {
-    if (status == "ok") return {};
-    if (status == "not_found")
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    if (status == "incomplete" || status == "unavailable")
-        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-    if (status == "timeout") return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
-    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-}
-
 class KvcsLowLevelDriver final : public KvcsDriver {
    public:
     KvcsLowLevelDriver(Config config, uint32_t index)
@@ -199,54 +189,6 @@ class KvcsLowLevelDriver final : public KvcsDriver {
     }
     uint64_t MaxValueSize() const override { return config_.max_value_size; }
     uint32_t MaxKeySize() const override { return config_.max_key_size; }
-
-    KvcsIoResults BatchQuery(std::span<const ObjectKey> keys) override {
-        if (!client_)
-            return Errors<KvcsIoResults>(keys.size(),
-                                         ErrorCode::INTERNAL_ERROR);
-        KvcsIoResults results(keys.size());
-        auto valid_indices = CollectValidIndices(
-            keys,
-            [this](const ObjectKey& key) {
-                return IsKvcsKeyStringSafe(key, config_.max_key_size);
-            },
-            results);
-
-        const size_t limit = static_cast<size_t>(config_.max_keys_per_batch);
-        for (size_t begin = 0; begin < valid_indices.size(); begin += limit) {
-            const size_t count = std::min(limit, valid_indices.size() - begin);
-            std::vector<const char*> pointers(count);
-            std::vector<kvcs_query_result_t> native(count);
-            for (size_t i = 0; i < count; ++i)
-                pointers[i] = keys[valid_indices[begin + i]].c_str();
-            const int returned = kvcs_ll_batch_query(
-                client_, pointers.data(), static_cast<int>(count),
-                native.data(), static_cast<int>(count),
-                DeadlineNs(config_.operation_timeout_ms), &options_);
-            if (returned < 0) {
-                SetBatchError(results, valid_indices, begin, count,
-                              CallError(returned));
-                continue;
-            }
-            // The SDK returns either 0 or the requested item count on success.
-            if (returned != 0 && returned != static_cast<int>(count)) {
-                SetBatchError(results, valid_indices, begin, count,
-                              ErrorCode::INTERNAL_ERROR);
-            } else {
-                for (size_t i = 0; i < count; ++i) {
-                    const auto status = std::string_view(
-                        native[i].status,
-                        strnlen(native[i].status, sizeof(native[i].status)));
-                    results[valid_indices[begin + i]] = QueryStatus(status);
-                }
-            }
-            const int initialized =
-                returned == 0 ? static_cast<int>(count)
-                              : std::min(returned, static_cast<int>(count));
-            kvcs_query_result_free(native.data(), initialized);
-        }
-        return results;
-    }
 
     KvcsIoResults BatchPut(std::span<const KvcsIoRequest> requests) override {
         if (!client_)
@@ -304,14 +246,16 @@ class KvcsLowLevelDriver final : public KvcsDriver {
                                          ErrorCode::INTERNAL_ERROR);
         KvcsIoResults results(requests.size());
         auto valid_indices = CollectValidIndices(
-            requests, [this](const auto& request) { return Valid(request); },
+            requests,
+            [this](const auto& request) {
+                return request.slices.size() == 1 && Valid(request);
+            },
             results);
 
         const size_t limit = static_cast<size_t>(config_.max_keys_per_batch);
         for (size_t begin = 0; begin < valid_indices.size(); begin += limit) {
             const size_t count = std::min(limit, valid_indices.size() - begin);
             std::vector<kvcs_ll_get_item_t> items(count);
-            std::vector<std::vector<char>> staging(count);
             std::vector<void*> buffers(count);
             std::vector<size_t> capacities(count);
             std::vector<int> statuses(count);
@@ -320,10 +264,6 @@ class KvcsLowLevelDriver final : public KvcsDriver {
                 const auto& request = requests[valid_indices[begin + i]];
                 items[i] = {.key = request.logical_key.c_str()};
                 buffers[i] = request.slices.front().ptr;
-                if (request.slices.size() > 1) {
-                    staging[i].resize(static_cast<size_t>(request.size));
-                    buffers[i] = staging[i].data();
-                }
                 capacities[i] = static_cast<size_t>(request.size);
             }
             const int call = kvcs_ll_batch_get_into(
@@ -352,13 +292,6 @@ class KvcsLowLevelDriver final : public KvcsDriver {
                     results[result_index] =
                         tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                     continue;
-                }
-                size_t offset = 0;
-                for (const auto& slice : request.slices) {
-                    if (!staging[i].empty())
-                        std::memcpy(slice.ptr, staging[i].data() + offset,
-                                    slice.size);
-                    offset += slice.size;
                 }
                 results[result_index] = {};
             }

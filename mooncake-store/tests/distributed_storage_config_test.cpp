@@ -183,14 +183,6 @@ TEST_F(DistributedStorageConfigTest, ExplicitKvcsAdapterSelectsLowLevel) {
 
     EXPECT_EQ(config.fs_adapter_type, "kvcs-lowlevel");
     EXPECT_EQ(config.object_storage_config_path, "/etc/kvcs/efc.yaml");
-    EXPECT_TRUE(config.enable_health_check);
-}
-
-TEST_F(DistributedStorageConfigTest, KvcsHealthCheckCanBeExplicitlyDisabled) {
-    env.health_check.Set("false");
-    env.fs_adapter.Set("kvcs-lowlevel");
-    const auto config = DistributedStorageConfig::FromEnvironment();
-    EXPECT_TRUE(config.UsesKvcs());
     EXPECT_FALSE(config.enable_health_check);
 }
 
@@ -265,13 +257,6 @@ TEST_F(DistributedStorageConfigTest,
     EXPECT_DOUBLE_EQ(config.eviction_high_watermark, 0.9);
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.7);
     EXPECT_TRUE(logs.empty());
-}
-
-TEST(DistributedStorageConfigValidationTest, AcceptsKvcsHealthCheck) {
-    DistributedStorageConfig config;
-    config.fs_adapter_type = "kvcs-lowlevel";
-    config.enable_health_check = true;
-    EXPECT_TRUE(config.Validate());
 }
 
 TEST(DistributedStorageConfigValidationTest, KvcsUsesDfsEvictionSettings) {

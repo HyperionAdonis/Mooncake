@@ -986,7 +986,8 @@ class Client {
                                             const WriteBufferStager& stager);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
-    void SubmitDfsWrites(std::vector<PutOperation>& ops);
+    void SubmitDfsWrites(std::vector<PutOperation>& ops,
+                         bool replace_existing = false);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
@@ -997,7 +998,8 @@ class Client {
     std::vector<ErrorCode> WriteDfsReplicas(
         const std::vector<std::string>& keys,
         const std::vector<const std::vector<Slice>*>& slice_lists,
-        const std::vector<DistributedFSDescriptor>& descriptors);
+        const std::vector<DistributedFSDescriptor>& descriptors,
+        bool replace_existing = false);
 
     std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
         std::vector<PutOperation>& ops, bool is_upsert);

@@ -9,7 +9,6 @@
 
 #include <csignal>
 #include <algorithm>
-#include <array>
 #include <cassert>
 #include <cerrno>
 #include <chrono>
@@ -418,93 +417,49 @@ FinalizeDecision DetermineFinalizeDecision(
                          : summary.first_error};
 }
 
-std::optional<ReplicaID> FindDfsReplicaId(
-    std::span<const Replica::Descriptor> replicas) {
-    auto replica = std::find_if(
-        replicas.begin(), replicas.end(),
-        [](const Replica::Descriptor& item) { return item.is_dfs_replica(); });
-    if (replica == replicas.end()) return std::nullopt;
-    return replica->id;
-}
-
 bool IsIdempotentDeleteSuccess(const tl::expected<void, ErrorCode>& result) {
     return result || result.error() == ErrorCode::OBJECT_NOT_FOUND;
 }
 
-// A KVCS value must not survive a failed or ambiguous write. Reuse the existing
-// primary-write revoke while the replica is PROCESSING; if PutEnd actually
-// committed and only its response was lost, reuse the existing conditional
-// disk-replica eviction to remove exactly the observed generation.
-void CleanupKvcsFailedPut(
-    DistributedStorageBackend& backend, MasterClient& master_client,
-    std::span<const std::pair<std::string, ReplicaID>> objects) {
-    if (objects.empty()) return;
-
-    std::vector<std::string> keys;
-    keys.reserve(objects.size());
-    for (const auto& [key, _] : objects) keys.push_back(key);
-
+// A failed KVCS write may still have stored the value. Delete it before
+// revoking the PROCESSING metadata so an untracked value cannot survive the
+// failure.
+void CleanupKvcsFailedWrite(DistributedStorageBackend& backend,
+                            MasterClient& master_client,
+                            const std::vector<std::string>& keys,
+                            bool is_upsert = false) {
     auto deleted = backend.BatchDeleteObjects(keys);
     if (deleted.size() != keys.size()) {
-        LOG(ERROR) << "KVCS put cleanup response size mismatch";
-    }
-
-    std::vector<bool> physically_removed(objects.size(), false);
-    std::vector<size_t> retry_indices;
-    std::vector<std::string> retry_keys;
-    retry_indices.reserve(objects.size());
-    retry_keys.reserve(objects.size());
-    for (size_t i = 0; i < objects.size(); ++i) {
-        if (i < deleted.size() && IsIdempotentDeleteSuccess(deleted[i])) {
-            physically_removed[i] = true;
-            continue;
-        }
-        retry_indices.push_back(i);
-        retry_keys.push_back(objects[i].first);
-    }
-    if (!retry_keys.empty()) {
-        auto retries = backend.BatchDeleteObjects(retry_keys);
-        if (retries.size() != retry_keys.size()) {
-            LOG(ERROR) << "KVCS put cleanup retry response size mismatch";
-        }
-        for (size_t i = 0; i < std::min(retries.size(), retry_keys.size());
-             ++i) {
-            if (IsIdempotentDeleteSuccess(retries[i])) {
-                physically_removed[retry_indices[i]] = true;
-            } else {
-                LOG(ERROR) << "Failed to remove KVCS value after Put failure, "
-                              "key="
-                           << retry_keys[i]
-                           << ", error=" << toString(retries[i].error());
-            }
-        }
+        LOG(ERROR) << "KVCS write cleanup response size mismatch";
     }
 
     std::vector<std::string> revoke_keys;
-    std::vector<ReplicaID> revoke_replica_ids;
-    for (size_t i = 0; i < objects.size(); ++i) {
-        if (physically_removed[i]) {
-            revoke_keys.push_back(objects[i].first);
-            revoke_replica_ids.push_back(objects[i].second);
+    revoke_keys.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (i < deleted.size() && IsIdempotentDeleteSuccess(deleted[i])) {
+            revoke_keys.push_back(keys[i]);
+            continue;
+        }
+        if (i < deleted.size()) {
+            LOG(ERROR)
+                << "Failed to remove KVCS value after write failure, key="
+                << keys[i] << ", error=" << toString(deleted[i].error());
         }
     }
     if (revoke_keys.empty()) return;
 
-    auto revoked = master_client.BatchPutRevoke(revoke_keys, ReplicaType::ALL);
+    auto revoked =
+        is_upsert ? master_client.BatchUpsertRevoke(revoke_keys)
+                  : master_client.BatchPutRevoke(revoke_keys, ReplicaType::ALL);
     if (revoked.size() != revoke_keys.size()) {
-        LOG(ERROR) << "KVCS put cleanup revoke response size mismatch";
+        LOG(ERROR) << "KVCS write cleanup revoke response size mismatch";
     }
     for (size_t i = 0; i < std::min(revoked.size(), revoke_keys.size()); ++i) {
-        if (revoked[i]) continue;
-        auto evicted = master_client.EvictDiskReplicaIfCurrent(
-            revoke_keys[i], master_client.tenant_id(), ReplicaType::DFS,
-            revoke_replica_ids[i]);
-        if (!evicted) {
-            LOG(ERROR) << "Failed to clean KVCS metadata after Put failure, "
+        if (!revoked[i])
+            LOG(ERROR) << "Failed to revoke KVCS metadata after write failure, "
                           "key="
                        << revoke_keys[i]
-                       << ", error=" << toString(evicted.error());
-        }
+                       << ", error=" << toString(revoked[i].error());
     }
 }
 
@@ -2202,23 +2157,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         auto end_result = master_client_.PutEnd(
             ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
         if (!end_result) {
-            // PutEnd is idempotent. Retry once before compensating because an
-            // RPC failure may mean that Master committed the metadata but the
-            // response was lost.
-            end_result = master_client_.PutEnd(ObjectMeta{key, object_checksum},
-                                               *finalize_decision.end_type);
-        }
-        if (!end_result) {
             ErrorCode err = end_result.error();
-            if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs() &&
-                transfer_summary.successful_dfs_transfers > 0) {
-                if (auto replica_id = FindDfsReplicaId(*start_result)) {
-                    const std::array<std::pair<std::string, ReplicaID>, 1>
-                        cleanup{{{key, *replica_id}}};
-                    CleanupKvcsFailedPut(*dfs_storage_backend_, master_client_,
-                                         cleanup);
-                }
-            }
             LOG(ERROR) << "Failed to end put operation: " << err;
             return tl::unexpected(err);
         }
@@ -2231,13 +2170,9 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         if (!finalize_decision.success && dfs_storage_backend_ &&
             dfs_storage_backend_->UsesKvcs() &&
             transfer_summary.failed_dfs_transfers > 0) {
-            if (auto replica_id = FindDfsReplicaId(*start_result)) {
-                const std::array<std::pair<std::string, ReplicaID>, 1> cleanup{
-                    {{key, *replica_id}}};
-                CleanupKvcsFailedPut(*dfs_storage_backend_, master_client_,
-                                     cleanup);
-                return tl::unexpected(finalize_decision.error);
-            }
+            CleanupKvcsFailedWrite(*dfs_storage_backend_, master_client_,
+                                   {key});
+            return tl::unexpected(finalize_decision.error);
         }
         auto revoke_result =
             master_client_.PutRevoke(key, *finalize_decision.revoke_type);
@@ -2316,9 +2251,6 @@ Client::DiskReplicaHealResult Client::healDanglingLocalDiskReplica(
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
                                              const ReplicateConfig& config) {
-    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs()) {
-        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
-    }
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2408,8 +2340,9 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
             dfs_slices.push_back(&slices);
             dfs_descriptors.push_back(replica.get_dfs_descriptor());
         }
-        const auto dfs_results =
-            WriteDfsReplicas(dfs_keys, dfs_slices, dfs_descriptors);
+        const auto dfs_results = WriteDfsReplicas(
+            dfs_keys, dfs_slices, dfs_descriptors,
+            dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs());
         for (auto dfs_result : dfs_results) {
             if (dfs_result == ErrorCode::OK) {
                 transfer_summary.RecordSuccess(ReplicaType::DFS);
@@ -2447,6 +2380,13 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         }
     }
     if (finalize_decision.revoke_type.has_value()) {
+        if (!finalize_decision.success && dfs_storage_backend_ &&
+            dfs_storage_backend_->UsesKvcs() &&
+            transfer_summary.failed_dfs_transfers > 0) {
+            CleanupKvcsFailedWrite(*dfs_storage_backend_, master_client_, {key},
+                                   true);
+            return tl::unexpected(finalize_decision.error);
+        }
         auto revoke_result =
             master_client_.UpsertRevoke(key, *finalize_decision.revoke_type);
         if (!revoke_result) {
@@ -3012,7 +2952,8 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
 std::vector<ErrorCode> Client::WriteDfsReplicas(
     const std::vector<std::string>& keys,
     const std::vector<const std::vector<Slice>*>& slice_lists,
-    const std::vector<DistributedFSDescriptor>& descriptors) {
+    const std::vector<DistributedFSDescriptor>& descriptors,
+    bool replace_existing) {
     if (keys.size() != slice_lists.size() ||
         keys.size() != descriptors.size()) {
         return std::vector<ErrorCode>(keys.size(), ErrorCode::INVALID_PARAMS);
@@ -3113,7 +3054,8 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     }
 
     const auto write_start = std::chrono::steady_clock::now();
-    auto write_results = dfs_storage_backend_->BatchWrite(requests);
+    auto write_results =
+        dfs_storage_backend_->BatchWrite(requests, replace_existing);
     const auto write_latency_us = elapsed_us_since(write_start);
     int64_t success_keys = 0;
     uint64_t success_bytes = 0;
@@ -3160,7 +3102,8 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     return results;
 }
 
-void Client::SubmitDfsWrites(std::vector<PutOperation>& ops) {
+void Client::SubmitDfsWrites(std::vector<PutOperation>& ops,
+                             bool replace_existing) {
     std::vector<std::string> keys;
     std::vector<const std::vector<Slice>*> slice_lists;
     std::vector<DistributedFSDescriptor> descriptors;
@@ -3207,7 +3150,8 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops) {
         dfs_metric->RecordSkippedWrites(skipped_writes);
     }
 
-    auto results = WriteDfsReplicas(keys, slice_lists, descriptors);
+    auto results =
+        WriteDfsReplicas(keys, slice_lists, descriptors, replace_existing);
     for (size_t i = 0; i < results.size(); ++i) {
         auto& op = ops[op_indices[i]];
         if (results[i] == ErrorCode::OK) {
@@ -3237,7 +3181,7 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     std::vector<bool> should_succeed(ops.size(), false);
     std::vector<ErrorCode> terminal_errors(ops.size(), ErrorCode::OK);
     std::vector<std::optional<ErrorCode>> finalize_rpc_errors(ops.size());
-    std::vector<std::pair<std::string, ReplicaID>> failed_kvcs_puts;
+    std::vector<std::string> failed_kvcs_puts;
 
     auto add_group_entry = [](BatchFinalizeGroup& group, const std::string& key,
                               size_t index) {
@@ -3310,10 +3254,8 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
             finalize_decision.revoke_type == ReplicaType::ALL &&
             dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs() &&
             op.transfer_summary.failed_dfs_transfers > 0) {
-            if (auto replica_id = FindDfsReplicaId(op.replicas)) {
-                failed_kvcs_puts.emplace_back(op.key, *replica_id);
-                cleanup_failed_kvcs_put = true;
-            }
+            failed_kvcs_puts.push_back(op.key);
+            cleanup_failed_kvcs_put = true;
         }
         if (!cleanup_failed_kvcs_put) {
             add_finalize_action(finalize_decision.revoke_type, false, op.key,
@@ -3322,8 +3264,8 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     }
 
     if (!failed_kvcs_puts.empty()) {
-        CleanupKvcsFailedPut(*dfs_storage_backend_, master_client_,
-                             failed_kvcs_puts);
+        CleanupKvcsFailedWrite(*dfs_storage_backend_, master_client_,
+                               failed_kvcs_puts);
     }
 
     auto process_end_group = [&](BatchFinalizeGroup& group,
@@ -3338,30 +3280,6 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
                 group.keys[i], ops[group.indices[i]].object_checksum});
         }
         auto responses = master_client_.BatchPutEnd(object_metas, replica_type);
-        if (responses.size() == group.keys.size()) {
-            std::vector<ObjectMeta> retry_metas;
-            std::vector<size_t> retry_response_indices;
-            for (size_t i = 0; i < responses.size(); ++i) {
-                if (!responses[i]) {
-                    retry_metas.push_back(object_metas[i]);
-                    retry_response_indices.push_back(i);
-                }
-            }
-            if (!retry_metas.empty()) {
-                auto retries =
-                    master_client_.BatchPutEnd(retry_metas, replica_type);
-                if (retries.size() == retry_metas.size()) {
-                    for (size_t i = 0; i < retries.size(); ++i) {
-                        responses[retry_response_indices[i]] =
-                            std::move(retries[i]);
-                    }
-                }
-            }
-        } else {
-            // A transport failure can also surface as an invalid batch shape.
-            // Retrying the whole idempotent batch is safe.
-            responses = master_client_.BatchPutEnd(object_metas, replica_type);
-        }
         if (responses.size() != group.keys.size()) {
             for (size_t idx : group.indices) {
                 finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
@@ -3415,25 +3333,6 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     process_revoke_group(revoke_all_group, ReplicaType::ALL);
     process_revoke_group(revoke_memory_group, ReplicaType::MEMORY);
     process_revoke_group(revoke_nof_group, ReplicaType::NOF_SSD);
-
-    // KVCS insert succeeded but Master finalization did not converge after an
-    // idempotent retry. Delete the provider value, then reuse PutRevoke to
-    // discard processing metadata. If PutEnd actually committed and only its
-    // response was lost, PutRevoke rejects the completed replica; the existing
-    // compare-by-replica-id eviction closes exactly that metadata instead.
-    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs()) {
-        std::vector<std::pair<std::string, ReplicaID>> cleanup;
-        for (size_t i = 0; i < ops.size(); ++i) {
-            if (!should_succeed[i] || !finalize_rpc_errors[i].has_value() ||
-                ops[i].transfer_summary.successful_dfs_transfers == 0) {
-                continue;
-            }
-            auto replica_id = FindDfsReplicaId(ops[i].replicas);
-            if (!replica_id) continue;
-            cleanup.emplace_back(ops[i].key, *replica_id);
-        }
-        CleanupKvcsFailedPut(*dfs_storage_backend_, master_client_, cleanup);
-    }
 
     auto append_finalize_error_context = [&](PutOperation& op, size_t index) {
         if (finalize_rpc_errors[index].has_value()) {
@@ -3490,11 +3389,13 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
     std::vector<size_t> successful_indices;
     std::vector<std::string> failed_keys;
     std::vector<size_t> failed_indices;
+    std::vector<std::string> failed_kvcs_keys;
 
     successful_object_metas.reserve(ops.size());
     successful_indices.reserve(ops.size());
     failed_keys.reserve(ops.size());
     failed_indices.reserve(ops.size());
+    failed_kvcs_keys.reserve(ops.size());
 
     for (size_t i = 0; i < ops.size(); ++i) {
         auto& op = ops[i];
@@ -3518,9 +3419,19 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
                     "Replica transfer failed before upsert finalize"));
         }
         if (!op.IsSuccessful() && !op.replicas.empty()) {
-            failed_keys.emplace_back(op.key);
-            failed_indices.emplace_back(i);
+            if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs() &&
+                op.transfer_summary.failed_dfs_transfers > 0) {
+                failed_kvcs_keys.emplace_back(op.key);
+            } else {
+                failed_keys.emplace_back(op.key);
+                failed_indices.emplace_back(i);
+            }
         }
+    }
+
+    if (!failed_kvcs_keys.empty()) {
+        CleanupKvcsFailedWrite(*dfs_storage_backend_, master_client_,
+                               failed_kvcs_keys, true);
     }
 
     // Process successful operations
@@ -3762,7 +3673,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
             seg_to_ops.at(seg).transfer_summary.first_error;
         op.failure_context = seg_to_ops.at(seg).failure_context;
     }
-    SubmitDfsWrites(ops);
+    SubmitDfsWrites(ops, is_upsert);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
@@ -3834,10 +3745,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
-    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs()) {
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::NOT_SUPPORTED));
-    }
     ReplicateConfig client_cfg = PrepareReplicateConfig(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3859,7 +3766,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
     WaitForTransfers(ops);
-    SubmitDfsWrites(ops);
+    SubmitDfsWrites(ops,
+                    dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs());
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
@@ -4059,29 +3967,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
 
         if (!end_keys.empty()) {
             auto ended = master_client_.BatchRemoveEnd(end_keys, end_ids);
-            if (ended.size() == end_keys.size()) {
-                std::vector<std::string> retry_keys;
-                std::vector<ReplicaID> retry_ids;
-                std::vector<size_t> retry_indices;
-                for (size_t i = 0; i < ended.size(); ++i) {
-                    if (!ended[i] &&
-                        ended[i].error() != ErrorCode::OBJECT_NOT_FOUND) {
-                        retry_keys.push_back(end_keys[i]);
-                        retry_ids.push_back(end_ids[i]);
-                        retry_indices.push_back(i);
-                    }
-                }
-                if (!retry_keys.empty()) {
-                    auto retries =
-                        master_client_.BatchRemoveEnd(retry_keys, retry_ids);
-                    if (retries.size() == retry_keys.size()) {
-                        for (size_t i = 0; i < retries.size(); ++i)
-                            ended[retry_indices[i]] = std::move(retries[i]);
-                    }
-                }
-            } else {
-                ended = master_client_.BatchRemoveEnd(end_keys, end_ids);
-            }
             if (ended.size() != end_keys.size()) return results;
             std::vector<std::string> removed_keys;
             for (size_t i = 0; i < ended.size(); ++i) {

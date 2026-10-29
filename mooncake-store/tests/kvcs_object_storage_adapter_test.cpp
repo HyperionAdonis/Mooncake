@@ -42,20 +42,6 @@ class MemoryDriver final : public KvcsDriver {
         return results;
     }
 
-    KvcsIoResults BatchQuery(std::span<const ObjectKey> keys) override {
-        KvcsIoResults results;
-        for (const auto& key : keys) {
-            auto it = values_.find(key);
-            if (it == values_.end()) {
-                results.emplace_back(
-                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
-                continue;
-            }
-            results.emplace_back();
-        }
-        return results;
-    }
-
     KvcsIoResults BatchGet(std::span<const KvcsIoRequest> requests) override {
         KvcsIoResults results;
         for (const auto& request : requests) {
@@ -222,13 +208,14 @@ TEST(KvcsObjectStorageAdapterTest, PutGetAndRemove) {
     iovec put_iov{value.data(), value.size()};
     ASSERT_TRUE(adapter.PutBatch({{"key", &put_iov, 1}})[0]);
 
-    ASSERT_TRUE(adapter.Exists("key").value());
     std::string output(value.size(), '\0');
     ASSERT_TRUE(adapter.GetBatch({{"key", output.data(), output.size()}})[0]);
     EXPECT_EQ(output, value);
 
     ASSERT_TRUE(adapter.Delete("key"));
-    EXPECT_FALSE(adapter.Exists("key").value());
+    auto missing = adapter.GetBatch({{"key", output.data(), output.size()}});
+    ASSERT_FALSE(missing[0]);
+    EXPECT_EQ(missing[0].error(), ErrorCode::OBJECT_NOT_FOUND);
 }
 
 TEST(KvcsObjectStorageAdapterTest, RejectsOversizeBeforeProviderWrite) {
@@ -257,7 +244,10 @@ TEST(KvcsObjectStorageAdapterTest, DeleteKeepsPerKeyErrorsIsolated) {
     EXPECT_TRUE(removed[0]);
     ASSERT_FALSE(removed[1]);
     EXPECT_EQ(removed[1].error(), ErrorCode::INVALID_PARAMS);
-    EXPECT_FALSE(adapter.Exists("valid").value());
+    std::string output(value.size(), '\0');
+    auto missing = adapter.GetBatch({{"valid", output.data(), output.size()}});
+    ASSERT_FALSE(missing[0]);
+    EXPECT_EQ(missing[0].error(), ErrorCode::OBJECT_NOT_FOUND);
 }
 
 TEST(KvcsObjectStorageAdapterTest, GetRejectsMasterSizeMismatch) {
@@ -293,8 +283,6 @@ TEST(KvcsObjectStorageAdapterTest, BatchPutKeepsPerKeyErrorsIsolated) {
     ASSERT_FALSE(invalid[0]);
     EXPECT_EQ(invalid[0].error(), ErrorCode::INVALID_PARAMS);
     ASSERT_TRUE(invalid[1]);
-    EXPECT_TRUE(adapter.Exists("key").value());
-    EXPECT_TRUE(adapter.Exists("second").value());
 }
 
 TEST(KvcsObjectStorageAdapterTest, RejectsInvalidRequests) {
@@ -355,17 +343,15 @@ TEST(KvcsObjectStorageAdapterTest, OfficialMockSingleValueRoundTrip) {
                             .size = value.size()};
     ASSERT_TRUE(driver.BatchPut({&put, 1})[0]);
 
-    const std::array<ObjectKey, 1> keys{put.logical_key};
-    auto query = driver.BatchQuery(keys);
-    ASSERT_TRUE(query[0]);
     std::string output(value.size(), '\0');
     const KvcsIoRequest get{.logical_key = put.logical_key,
                             .slices = {{output.data(), output.size()}},
                             .size = output.size()};
     ASSERT_TRUE(driver.BatchGet({&get, 1})[0]);
     EXPECT_EQ(output, value);
+    const std::array<ObjectKey, 1> keys{put.logical_key};
     ASSERT_TRUE(driver.BatchDelete(keys)[0]);
-    auto after_delete = driver.BatchQuery(keys);
+    auto after_delete = driver.BatchGet({&get, 1});
     ASSERT_FALSE(after_delete[0]);
     EXPECT_EQ(after_delete[0].error(), ErrorCode::OBJECT_NOT_FOUND);
 }

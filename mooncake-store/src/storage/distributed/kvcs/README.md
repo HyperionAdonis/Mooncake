@@ -29,15 +29,18 @@ follow-up changes.
 Set `MOONCAKE_DFS_FS_ADAPTER=kvcs-lowlevel` on the cooperating Mooncake
 processes. The initial distributed-storage configuration is single-tenant;
 each logical key is mapped to a printable, injective provider key.
-Upsert/replace remains unsupported in this
-initial change; insert-only writes do not overwrite existing keys. Single-key
-`Remove` and `BatchRemove` use a Master-owned reservation: Master first checks
-the lease and replica state and hides the exact replica generation, the client
-then deletes the KVCS value, and Master either commits the metadata removal or
-restores the reserved replicas on provider failure. A missing provider value
-is idempotent. The reservation blocks a same-key Put while physical deletion
-is in flight. `RemoveByRegex` and `RemoveAll` return `NOT_SUPPORTED` in this
-initial KVCS mode because provider-wide conditional deletion is not defined.
+KVCS Low Level Put is insert-only, so Upsert reuses Mooncake's existing
+Master-owned Upsert state machine and performs a provider Delete followed by
+Put while the DFS replica is PROCESSING. A failed replacement is revoked after
+one best-effort provider cleanup; it does not restore the previous KVCS value.
+Single-key `Remove` and `BatchRemove` use a Master-owned reservation: Master
+first checks the lease and replica state and hides the exact replica generation,
+the client then deletes the KVCS value, and Master either commits the metadata
+removal or restores the reserved replicas on provider failure. A missing
+provider value is idempotent. The reservation blocks a same-key Put while
+physical deletion is in flight. `RemoveByRegex` and `RemoveAll` return
+`NOT_SUPPORTED` in this initial KVCS mode because provider-wide conditional
+deletion is not defined.
 
 The KVCS SDK is optional at build time. With no SDK, other Mooncake backends
 build normally and explicit KVCS initialization returns `NOT_SUPPORTED`.
@@ -63,11 +66,11 @@ Reads use the Master descriptor's size and reject a shorter or longer KVCS
 value. If Get explicitly returns `OBJECT_NOT_FOUND`, Mooncake conditionally
 removes only the DFS replica observed by that read, matching its `ReplicaID`
 under the Master metadata lock. A timeout, transport failure, or other KVCS
-error keeps metadata unchanged. Put and delete finalization retry the existing
-idempotent Master transition. If a KVCS Put is ambiguous, or succeeds but the
-metadata commit still fails, Mooncake deletes that value before reusing the
-existing revoke or compare-by-`ReplicaID` eviction path; it does not maintain
-a client-local uncertain-key index.
+error keeps metadata unchanged. Master finalization follows the existing client
+path without KVCS-specific retries. If a KVCS Put reports failure after it may
+have stored the value, Mooncake makes one best-effort delete before reusing the
+existing `PutRevoke` path; it does not maintain a client-local uncertain-key
+index.
 
 ## Temporary capacity source
 

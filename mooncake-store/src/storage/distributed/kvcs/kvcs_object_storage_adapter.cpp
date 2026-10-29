@@ -12,8 +12,6 @@
 namespace mooncake {
 namespace {
 
-constexpr std::string_view kHealthProbeKey = "kvcs-health-probe";
-
 template <typename T>
 std::vector<tl::expected<T, ErrorCode>> Errors(size_t count, ErrorCode error) {
     std::vector<tl::expected<T, ErrorCode>> results;
@@ -89,19 +87,6 @@ tl::expected<void, ErrorCode> KvcsObjectStorageAdapter::Init() {
     initialized_ = true;
     LOG(INFO) << "KVCS Low Level mountpoint_id=" << mountpoint_id
               << ", mountpoint_index=" << mountpoint_index;
-    return {};
-}
-
-tl::expected<void, ErrorCode> KvcsObjectStorageAdapter::CheckHealth() {
-    if (!initialized_) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    auto probe_key = EncodeKey(kHealthProbeKey);
-    if (!probe_key) return tl::make_unexpected(probe_key.error());
-    const std::array<ObjectKey, 1> probe{std::move(*probe_key)};
-    const auto result = driver_->BatchQuery(probe);
-    if (result.size() != 1)
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    if (!result[0] && result[0].error() != ErrorCode::OBJECT_NOT_FOUND)
-        return tl::make_unexpected(result[0].error());
     return {};
 }
 
@@ -209,20 +194,8 @@ std::vector<tl::expected<size_t, ErrorCode>> KvcsObjectStorageAdapter::GetBatch(
 }
 
 tl::expected<bool, ErrorCode> KvcsObjectStorageAdapter::Exists(
-    const std::string& key) {
-    if (!initialized_) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    auto encoded = EncodeKey(key);
-    if (!encoded) return tl::make_unexpected(encoded.error());
-    try {
-        auto result = driver_->BatchQuery({&*encoded, 1});
-        if (result.size() != 1)
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        if (result[0]) return true;
-        if (result[0].error() == ErrorCode::OBJECT_NOT_FOUND) return false;
-        return tl::make_unexpected(result[0].error());
-    } catch (...) {
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
+    const std::string&) {
+    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
 }
 
 tl::expected<void, ErrorCode> KvcsObjectStorageAdapter::Delete(

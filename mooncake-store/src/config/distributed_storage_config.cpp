@@ -168,8 +168,9 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
                                             config.allocator_type);
     config.object_storage_config_path = Environ::ReadOr(
         Variables::MOONCAKE_KVCS_EFC_CONFIG, config.object_storage_config_path);
-    config.enable_health_check = Environ::ReadOr(
-        Variables::MOONCAKE_DISTRIBUTED_HEALTH_CHECK, config.UsesKvcs());
+    config.enable_health_check =
+        Environ::ReadOr(Variables::MOONCAKE_DISTRIBUTED_HEALTH_CHECK,
+                        config.enable_health_check);
     config.shard_count = Environ::ReadOr(Variables::MOONCAKE_DFS_SHARD_COUNT,
                                          config.shard_count);
     config.shard_capacity = Environ::ReadOr(
