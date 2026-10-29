@@ -32,7 +32,8 @@ each logical key is mapped to a printable, injective provider key.
 KVCS Low Level Put is insert-only, so Upsert reuses Mooncake's existing
 Master-owned Upsert state machine and performs a provider Delete followed by
 Put while the DFS replica is PROCESSING. A failed replacement is revoked after
-one best-effort provider cleanup; it does not restore the previous KVCS value.
+one best-effort provider cleanup confirms the value is absent; it does not
+restore the previous KVCS value.
 Single-key `Remove` and `BatchRemove` use a Master-owned reservation: Master
 first checks the lease and replica state and hides the exact replica generation,
 the client then deletes the KVCS value, and Master either commits the metadata
@@ -68,9 +69,9 @@ removes only the DFS replica observed by that read, matching its `ReplicaID`
 under the Master metadata lock. A timeout, transport failure, or other KVCS
 error keeps metadata unchanged. Master finalization follows the existing client
 path without KVCS-specific retries. If a KVCS Put reports failure after it may
-have stored the value, Mooncake makes one best-effort delete before reusing the
-existing `PutRevoke` path; it does not maintain a client-local uncertain-key
-index.
+have stored the value, Mooncake makes one best-effort delete and reuses the
+existing `PutRevoke` path only after the value is confirmed absent; it does not
+maintain a client-local uncertain-key index.
 
 ## Temporary capacity source
 
