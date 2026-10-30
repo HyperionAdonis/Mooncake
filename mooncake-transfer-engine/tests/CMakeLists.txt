@@ -118,8 +118,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     worker_pool_rail_state_test
     PRIVATE
     "-Wl,--wrap=_ZN8mooncake11RdmaContext17refreshCurrentGidEPNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES7_"
-    "-Wl,--wrap=_ZNK8mooncake11RdmaContext14queryPortStateEP14ibv_port_state"
-  )
+    "-Wl,--wrap=_ZNK8mooncake11RdmaContext14queryPortStateEP14ibv_port_state")
 endif()
 add_test(NAME worker_pool_rail_state_test COMMAND worker_pool_rail_state_test)
 
@@ -365,10 +364,9 @@ if(USE_EFA)
 
   add_executable(efa_stale_segment_desc_test
                  ${WORKSPACE}/efa_stale_segment_desc_test.cpp)
-  target_link_libraries(efa_stale_segment_desc_test PUBLIC transfer_engine gtest
-                                                           gtest_main)
-  add_test(NAME efa_stale_segment_desc_test
-           COMMAND efa_stale_segment_desc_test)
+  target_link_libraries(efa_stale_segment_desc_test PUBLIC transfer_engine
+                                                           gtest gtest_main)
+  add_test(NAME efa_stale_segment_desc_test COMMAND efa_stale_segment_desc_test)
 
   # Compiles the real EfaEndPoint source against the test-only
   # RPC/address-vector fakes in efa_endpoint_handshake_fakes/ (shadowed
@@ -527,6 +525,11 @@ add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)
 target_link_libraries(transfer_metadata_test PUBLIC transfer_engine gtest
                                                     gtest_main)
 add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)
+
+add_executable(coro_handshake_test ${WORKSPACE}/coro_handshake_test.cpp)
+target_link_libraries(coro_handshake_test PUBLIC transfer_engine gtest
+                                                 gtest_main)
+add_test(NAME coro_handshake_test COMMAND coro_handshake_test)
 
 add_executable(config_test ${WORKSPACE}/config_test.cpp)
 target_link_libraries(config_test PUBLIC transfer_engine gtest gtest_main)
