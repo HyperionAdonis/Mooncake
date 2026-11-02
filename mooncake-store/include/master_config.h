@@ -879,8 +879,8 @@ class MasterServiceConfigBuilder {
     ViewVersionId view_version_ = 0;
     int64_t client_active_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool client_active_ttl_explicitly_set_ = false;
-    int64_t session_ttl_sec = 0;
-    int64_t session_cleanup_batch_size_bytes = 0;
+    int64_t session_ttl_sec_ = 0;
+    int64_t session_cleanup_batch_size_bytes_ = 0;
     std::optional<int64_t> client_suspicion_ttl_sec_;
     int64_t nof_heartbeat_interval_sec_ = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms_ =
